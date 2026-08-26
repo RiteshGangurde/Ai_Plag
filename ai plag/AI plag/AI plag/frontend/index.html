@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Plag Frontend</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      window.__API_BASE_URL__ = window.__API_BASE_URL__ || new URLSearchParams(window.location.search).get('apiBaseUrl') || '';
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

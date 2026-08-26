@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+build/
+
+.vscode/
+*.log
+
+.DS_Store
