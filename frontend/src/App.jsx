@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react'
 import Sidebar from './components/Sidebar'
 
 const getApiBaseUrl = () => {
-  return 'http://localhost:8000'
+  return 'VITE_API_BASE_URL=https://aiplag-production.up.railway.app'
 }
 
 const buildApiUrl = (path) => {
