@@ -1,7 +1,11 @@
 import hashlib
 import os
-from dotenv import load_dotenv
-load_dotenv()
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import json
 import time
 import requests
