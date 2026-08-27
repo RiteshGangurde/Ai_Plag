@@ -6,11 +6,11 @@ export default defineConfig({
   server: {
     proxy: {
       '/analyze': {
-        target: 'http://aiplag-production.up.railway.app',
+        target: 'https://aiplag-production.up.railway.app',
         changeOrigin: true,
       },
       '/subscribe': {
-        target: 'http://aiplag-production.up.railway.app',
+        target: 'https://aiplag-production.up.railway.app',
         changeOrigin: true,
       },
     },

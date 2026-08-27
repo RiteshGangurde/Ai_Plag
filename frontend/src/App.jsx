@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react'
 import Sidebar from './components/Sidebar'
 
 const getApiBaseUrl = () => {
-  return 'http://aiplag-production.up.railway.app'
+  return 'https://aiplag-production.up.railway.app'
 }
 
 const buildApiUrl = (path) => {
