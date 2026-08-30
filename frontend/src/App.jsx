@@ -147,11 +147,18 @@ export default function App() {
     setError(null)
     setSubscriptionStatus(null)
 
+    if (!authToken) {
+      setError('Please sign in before subscribing to a plan.')
+      setSubscribing(false)
+      return
+    }
+
     try {
       const res = await fetch(buildApiUrl('/subscribe'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
         },
         body: JSON.stringify({
           plan: selectedPlan,

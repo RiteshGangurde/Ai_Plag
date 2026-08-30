@@ -541,11 +541,13 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
         raise HTTPException(status_code=400, detail="PhonePe checkout requires a phone number.")
 
     if not authorization:
+        print("SUBSCRIBE REJECTED: no Authorization header was sent by the client.")
         raise HTTPException(status_code=401, detail="Sign in before subscribing to a plan.")
 
     token = authorization.replace("Bearer ", "", 1)
     user = find_user_by_token(token)
     if not user:
+        print(f"SUBSCRIBE REJECTED: no user found for token {token!r}.")
         raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
 
     username = user.get("username")
