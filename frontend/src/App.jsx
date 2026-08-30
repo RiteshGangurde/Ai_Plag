@@ -56,8 +56,6 @@ export default function App() {
   const [error, setError] = useState(null)
   const [analysisMode, setAnalysisMode] = useState('ai')
   const [selectedPlan, setSelectedPlan] = useState('basic')
-  const [paymentMethod, setPaymentMethod] = useState('google_pay')
-  const [phoneNumber, setPhoneNumber] = useState('')
   const [subscriptionStatus, setSubscriptionStatus] = useState(null)
   const [subscribing, setSubscribing] = useState(false)
   const [adminUsername, setAdminUsername] = useState('')
@@ -77,7 +75,6 @@ export default function App() {
   const [authError, setAuthError] = useState(null)
   const [authMessage, setAuthMessage] = useState('')
   const [authUser, setAuthUser] = useState(null)
-  const [paymentEventId, setPaymentEventId] = useState(null)
   const [refreshingStatus, setRefreshingStatus] = useState(false)
   const [historyRecords, setHistoryRecords] = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
@@ -160,94 +157,102 @@ export default function App() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${authToken}`,
         },
-        body: JSON.stringify({
-          plan: selectedPlan,
-          payment_method: paymentMethod,
-          phone_number: paymentMethod === 'phonepe' ? phoneNumber : undefined,
-        }),
+        body: JSON.stringify({ plan: selectedPlan }),
       })
 
       const data = await parseJsonResponse(res)
       if (!res.ok) {
-        throw new Error(extractErrorMessage(data, 'Subscription request failed'))
+        throw new Error(extractErrorMessage(data, 'Unable to create payment.'))
       }
 
-      setSubscriptionStatus({
-        message: data.message,
-        method: data.payment_method,
-        provider: data.provider,
-      })
-      setPaymentEventId(data.payment_event_id || null)
+      // If the account is already active, go straight to the dashboard.
+      if (data.status === 'already_active') {
+        const updatedUser = await loadUserProfile(authToken)
+        setAuthUser(updatedUser || data.user)
+        setActiveNav('dashboard')
+        return
+      }
 
-      if (data.provider === 'razorpay' && data.checkout?.key && data.checkout?.order_id) {
-        await loadRazorpayScript()
-        const options = {
-          key: data.checkout.key,
-          amount: data.checkout.amount,
-          currency: data.checkout.currency,
-          name: 'AI Plag Detector',
-          description: `Subscription: ${data.plan}`,
-          order_id: data.checkout.order_id,
-          handler: async function (response) {
-            try {
-              if (!data.payment_event_id) {
-                throw new Error(
-                  'No payment_event_id was returned from /subscribe, so the payment cannot be confirmed. Please retry subscribing.'
-                )
-              }
+      if (data.provider !== 'razorpay' || !data.checkout?.key || !data.checkout?.order_id) {
+        throw new Error('Razorpay checkout could not be created. Please try again.')
+      }
 
-              const confirmPayload = {
-                payment_event_id: data.payment_event_id,
-                payment_id: response?.razorpay_payment_id || `pay_${Date.now()}`,
-                status: 'completed',
-              }
-              console.log('[payment-confirm] sending payload:', confirmPayload)
+      await loadRazorpayScript()
 
-              const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(confirmPayload),
-              })
-              const confirmData = await parseJsonResponse(confirmRes)
-              if (!confirmRes.ok) {
-                throw new Error(extractErrorMessage(confirmData, 'Payment confirmation failed on the server.'))
-              }
+      const options = {
+        key: data.checkout.key,
+        amount: data.checkout.amount,
+        currency: data.checkout.currency,
+        name: 'AI Detection Analyzer',
+        description: `${data.plan} subscription`,
+        order_id: data.checkout.order_id,
+        prefill: {
+          name: authUser?.username || '',
+          email: authUser?.email || '',
+        },
+        theme: {
+          color: '#7C3AED',
+        },
+        handler: async function (response) {
+          try {
+            setSubscriptionStatus({
+              message: 'Payment received. Verifying payment…',
+              provider: 'razorpay',
+            })
 
-              // Re-check the plan is actually active before redirecting.
-              // Retry a few times in case the database write hasn't
-              // propagated to a read yet.
-              let updatedUser = null
-              for (let attempt = 0; attempt < 5; attempt += 1) {
-                updatedUser = await loadUserProfile(authToken)
-                if (updatedUser?.subscription?.status === 'active') break
-                await new Promise((resolve) => setTimeout(resolve, 700))
-              }
+            const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${authToken}`,
+              },
+              body: JSON.stringify({
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_signature: response.razorpay_signature,
+              }),
+            })
 
-              if (updatedUser?.subscription?.status === 'active') {
-                setSubscriptionStatus({
-                  message: 'Payment completed successfully. Your subscription is now active.',
-                  method: data.payment_method,
-                  provider: data.provider,
-                })
-                setActiveNav('dashboard')
-              } else {
-                setError('Payment was recorded, but the plan is not showing as active yet. Click "I\u2019ve paid — Refresh status" in a moment to try again.')
-              }
-            } catch (err) {
-              setError(err.message)
+            const confirmData = await parseJsonResponse(confirmRes)
+            if (!confirmRes.ok) {
+              throw new Error(extractErrorMessage(confirmData, 'Payment verification failed.'))
             }
-          },
-          prefill: {
-            contact: data.phone_number || '',
-          },
-          theme: {
-            color: '#7C3AED',
-          },
-        }
 
-        const razorpayInstance = new window.Razorpay(options)
-        razorpayInstance.open()
+            const updatedUser = await loadUserProfile(authToken)
+
+            if (updatedUser?.subscription?.status !== 'active') {
+              throw new Error('Payment was verified, but the subscription is not active yet. Please refresh and try again.')
+            }
+
+            setAuthUser(updatedUser)
+            setSubscriptionStatus({
+              message: 'Payment successful! Your subscription is active.',
+              provider: 'razorpay',
+            })
+            setError(null)
+
+            // Payment success → dashboard.
+            setActiveNav('dashboard')
+          } catch (err) {
+            console.error('[Razorpay] payment confirmation failed:', err)
+            setError(err.message)
+            setSubscriptionStatus(null)
+          }
+        },
+        modal: {
+          ondismiss: () => {
+            setSubscriptionStatus(null)
+          },
+        },
       }
+
+      const razorpayInstance = new window.Razorpay(options)
+      razorpayInstance.on('payment.failed', (response) => {
+        const description = response?.error?.description || 'Razorpay payment failed.'
+        setError(description)
+        setSubscriptionStatus(null)
+      })
+      razorpayInstance.open()
     } catch (err) {
       setError(err.message)
     } finally {
@@ -297,28 +302,6 @@ export default function App() {
     }
   }
 
-  const handleConfirmPayment = async (paymentEventId) => {
-    if (!adminToken) return
-    setAdminLoading(true)
-    setAdminError(null)
-    try {
-      const confirmPayload = { payment_event_id: paymentEventId, payment_id: `pay_${Date.now()}` }
-      console.log('[payment-confirm] sending payload:', confirmPayload)
-
-      const res = await fetch(buildApiUrl('/payment-confirm'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(confirmPayload),
-      })
-      const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(extractErrorMessage(data, 'Confirmation failed'))
-      await fetchAdminPayments(adminToken)
-    } catch (err) {
-      setAdminError(err.message)
-    } finally {
-      setAdminLoading(false)
-    }
-  }
 
   const handleSignUp = async (e) => {
     e.preventDefault()
@@ -506,7 +489,6 @@ export default function App() {
   const handleLogout = () => {
     setAuthToken(null)
     setAuthUser(null)
-    setPaymentEventId(null)
     setSubscriptionStatus(null)
     setActiveNav('dashboard')
   }
@@ -601,11 +583,7 @@ export default function App() {
                             <div key={idx} className="paragraph-item" style={{ borderLeftColor: '#7C3AED' }}>
                               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
                                 <strong>{event.plan} — {event.status}</strong>
-                                {event.status !== 'completed' && (
-                                  <button className="btn-secondary" type="button" onClick={() => handleConfirmPayment(event.id)}>
-                                    Confirm
-                                  </button>
-                                )}
+
                               </div>
                               <div style={{ marginTop: 10, color: 'var(--text-muted)', fontSize: '0.95rem' }}>
                                 Order: {event.order_id}<br />
@@ -663,15 +641,6 @@ export default function App() {
                 <div className="info-box">
                   <div className="subscription-card">
                     <h4 style={{ marginBottom: 12 }}>💳 Subscription Plans</h4>
-                    <div style={{ marginBottom: 18, padding: 16, borderRadius: 16, background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(124,58,237,0.14)' }}>
-                      <div style={{ marginBottom: 10, fontWeight: 700 }}>UPI ID</div>
-                      <div style={{ marginBottom: 14, fontSize: '1.05rem', color: 'var(--primary-dark)', fontWeight: 800 }}>
-                        gogreensavepaper@ibl
-                      </div>
-                      <div style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                        Use the UPI ID above to pay for your selected plan. Your subscription is activated after payment confirmation.
-                      </div>
-                    </div>
                     <div className="plan-selector" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 18 }}>
                       {[
                         { id: 'basic', title: 'Basic', description: '2999 words', price: '₹599/-' },
@@ -701,58 +670,14 @@ export default function App() {
                       ))}
                     </div>
                     <form onSubmit={handleSubscribe} className="subscription-form">
-                      <div className="payment-options" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
-                        <label className="payment-option">
-                          <input
-                            type="radio"
-                            name="payment_method"
-                            value="google_pay"
-                            checked={paymentMethod === 'google_pay'}
-                            onChange={(e) => setPaymentMethod(e.target.value)}
-                          />
-                          <span>Google Pay</span>
-                        </label>
-                        <label className="payment-option">
-                          <input
-                            type="radio"
-                            name="payment_method"
-                            value="phonepe"
-                            checked={paymentMethod === 'phonepe'}
-                            onChange={(e) => setPaymentMethod(e.target.value)}
-                          />
-                          <span>PhonePe</span>
-                        </label>
-                      </div>
-
-                      {paymentMethod === 'phonepe' && (
-                        <input
-                          type="tel"
-                          className="payment-input"
-                          placeholder="Enter phone number"
-                          value={phoneNumber}
-                          onChange={(e) => setPhoneNumber(e.target.value)}
-                          style={{ marginBottom: 12 }}
-                        />
-                      )}
+                      <p style={{ color: 'var(--text-muted)', marginBottom: 14 }}>
+                        Secure payment powered by Razorpay. You can use the payment methods available in Razorpay Checkout.
+                      </p>
 
                       <button type="submit" className="btn-submit" disabled={subscribing}>
                         {subscribing ? 'Processing…' : `Subscribe to ${selectedPlan.replace('_', ' ').replace(/\b\w/g, (x) => x.toUpperCase())}`}
                       </button>
                     </form>
-
-                    {subscriptionState?.status === 'pending' && (
-                      <div style={{ marginTop: 16, padding: 14, borderRadius: 12, background: 'rgba(249,115,22,0.1)', border: '1px solid rgba(249,115,22,0.3)' }}>
-                        <p style={{ fontWeight: 700, color: '#c2410c', marginBottom: 8 }}>
-                          Payment pending confirmation
-                        </p>
-                        <p style={{ color: 'var(--text-muted)', marginBottom: 10 }}>
-                          If you paid manually via UPI, this activates once confirmed. Already paid? Refresh your status below.
-                        </p>
-                        <button type="button" className="btn-secondary" onClick={handleRefreshSubscriptionStatus} disabled={refreshingStatus}>
-                          {refreshingStatus ? 'Checking…' : '🔄 I\u2019ve paid — Refresh status'}
-                        </button>
-                      </div>
-                    )}
 
                     {subscriptionStatus && (
                       <p style={{ marginTop: 12, color: '#15803d', fontWeight: 700 }}>

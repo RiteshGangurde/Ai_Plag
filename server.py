@@ -43,12 +43,12 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 
-try:
-    SUBSCRIPTION_AMOUNT = int(
-        float(os.getenv("SUBSCRIPTION_AMOUNT", "499"))
-    )
-except ValueError:
-    SUBSCRIPTION_AMOUNT = 499
+# Prices are selected server-side so the amount cannot be changed by the browser.
+PLAN_PRICES = {
+    "basic": 599,
+    "premium": 1499,
+    "premium_pro": 1999,
+}
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
@@ -744,10 +744,15 @@ def subscribe(
 
         }
 
-    plan = (
-        payload.plan.strip()
-        or "pro"
-    )
+    plan = (payload.plan or "basic").strip().lower()
+
+    if plan not in PLAN_PRICES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid subscription plan.",
+        )
+
+    amount = PLAN_PRICES[plan]
 
     receipt = (
 
@@ -759,13 +764,8 @@ def subscribe(
     )
 
     checkout = create_razorpay_order(
-
-        amount_rupees=
-            SUBSCRIPTION_AMOUNT,
-
-        receipt=
-            receipt,
-
+        amount_rupees=amount,
+        receipt=receipt,
     )
 
     order_id = checkout["id"]
@@ -783,7 +783,7 @@ def subscribe(
             plan,
 
         "amount":
-            SUBSCRIPTION_AMOUNT,
+            amount,
 
         "status":
             "created",
@@ -816,7 +816,7 @@ def subscribe(
             plan,
 
         "amount":
-            SUBSCRIPTION_AMOUNT,
+            amount,
 
         "created_at":
             int(time.time()),
