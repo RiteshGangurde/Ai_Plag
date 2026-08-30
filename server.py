@@ -117,8 +117,14 @@ class AdminLoginRequest(BaseModel):
 
 
 class PaymentConfirmRequest(BaseModel):
-    payment_event_id: str
-    payment_id: str
+    payment_event_id: Optional[str] = None
+
+    payment_id: Optional[str] = None
+
+    razorpay_payment_id: Optional[str] = None
+    razorpay_order_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
+
     status: str = "completed"
 
 
