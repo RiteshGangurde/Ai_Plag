@@ -43,12 +43,12 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 
-# Prices are selected server-side so the amount cannot be changed by the browser.
-PLAN_PRICES = {
-    "basic": 599,
-    "premium": 1499,
-    "premium_pro": 1999,
-}
+try:
+    SUBSCRIPTION_AMOUNT = int(
+        float(os.getenv("SUBSCRIPTION_AMOUNT", "499"))
+    )
+except ValueError:
+    SUBSCRIPTION_AMOUNT = 499
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
@@ -59,15 +59,18 @@ ANALYSIS_API_EXTRA = os.getenv("ANALYSIS_API_EXTRA", "").strip()
 
 
 # ============================================================
-# SIMPLE STORAGE
+# SIMPLE IN-MEMORY STORAGE
 # ============================================================
 #
-# NO MONGODB.
+# NO MONGODB
 #
-# WARNING:
-# Data disappears if Railway restarts/redeploys.
-# This is intentionally simple for your current MVP.
+# IMPORTANT:
+# Railway restart/redeploy will clear this data.
+# For your current MVP this keeps the backend extremely simple.
 #
+# If you later need permanent users/subscriptions, we can add
+# a database after the payment flow is completely stable.
+# ============================================================
 
 USERS: Dict[str, Dict[str, Any]] = {}
 
@@ -90,9 +93,9 @@ if FRONTEND_URL == "*":
 else:
 
     allowed_origins = [
-        x.strip()
-        for x in FRONTEND_URL.split(",")
-        if x.strip()
+        item.strip()
+        for item in FRONTEND_URL.split(",")
+        if item.strip()
     ]
 
     allow_credentials = True
@@ -112,48 +115,35 @@ app.add_middleware(
 # ============================================================
 
 class SignupRequest(BaseModel):
-
     username: str
-
     password: str
-
     email: Optional[str] = None
 
 
 class SigninRequest(BaseModel):
-
     username: str
-
     password: str
 
 
 class SubscribeRequest(BaseModel):
-
     plan: str = "pro"
-
     payment_method: str = "razorpay"
-
     phone_number: Optional[str] = None
 
 
 class PaymentConfirmRequest(BaseModel):
-
     razorpay_payment_id: str
-
     razorpay_order_id: str
-
     razorpay_signature: str
 
 
 class AdminLoginRequest(BaseModel):
-
     username: str
-
     password: str
 
 
 # ============================================================
-# PASSWORD FUNCTIONS
+# PASSWORD HASHING
 # ============================================================
 
 def hash_password(password: str) -> str:
@@ -299,7 +289,7 @@ def get_active_user(
 
 
 # ============================================================
-# USER RESPONSE
+# USER SERIALIZATION
 # ============================================================
 
 def serialize_user(
@@ -319,23 +309,19 @@ def serialize_user(
 
     return {
 
-        "username":
-            user.get("username"),
+        "username": user.get("username"),
 
-        "email":
-            user.get("email"),
+        "email": user.get("email"),
 
-        "created_at":
-            user.get("created_at"),
+        "created_at": user.get("created_at"),
 
-        "subscription":
-            subscription,
+        "subscription": subscription,
 
     }
 
 
 # ============================================================
-# RAZORPAY
+# RAZORPAY ORDER CREATION
 # ============================================================
 
 def create_razorpay_order(
@@ -364,31 +350,20 @@ def create_razorpay_order(
         )
 
     payload = {
-
-        "amount":
-            int(amount_rupees * 100),
-
-        "currency":
-            "INR",
-
-        "receipt":
-            receipt,
-
+        "amount": int(amount_rupees * 100),
+        "currency": "INR",
+        "receipt": receipt,
     }
 
     try:
 
         response = requests.post(
-
             "https://api.razorpay.com/v1/orders",
-
             auth=(
                 RAZORPAY_KEY_ID,
                 RAZORPAY_KEY_SECRET,
             ),
-
             json=payload,
-
             timeout=20,
         )
 
@@ -400,10 +375,7 @@ def create_razorpay_order(
 
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    "Razorpay did not return "
-                    "an order ID."
-                ),
+                detail="Razorpay did not return an order ID.",
             )
 
         return data
@@ -416,16 +388,17 @@ def create_razorpay_order(
             detail = response.text
 
         print(
-            "RAZORPAY ORDER ERROR:",
-            detail,
+            "===================================="
+        )
+        print("RAZORPAY ORDER ERROR")
+        print(detail)
+        print(
+            "===================================="
         )
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Razorpay order creation failed: "
-                f"{detail}"
-            ),
+            detail=f"Razorpay order creation failed: {detail}",
         ) from exc
 
     except requests.RequestException as exc:
@@ -441,6 +414,10 @@ def create_razorpay_order(
         ) from exc
 
 
+# ============================================================
+# RAZORPAY SIGNATURE VERIFICATION
+# ============================================================
+
 def verify_razorpay_signature(
     order_id: str,
     payment_id: str,
@@ -448,35 +425,24 @@ def verify_razorpay_signature(
 ) -> bool:
 
     if not RAZORPAY_KEY_SECRET:
-
         return False
 
-    message = (
-        f"{order_id}|{payment_id}"
-    )
+    message = f"{order_id}|{payment_id}"
 
     expected_signature = hmac.new(
-
-        RAZORPAY_KEY_SECRET.encode(
-            "utf-8"
-        ),
-
+        RAZORPAY_KEY_SECRET.encode("utf-8"),
         message.encode("utf-8"),
-
         hashlib.sha256,
-
     ).hexdigest()
 
     return hmac.compare_digest(
-
         expected_signature,
-
         signature,
     )
 
 
 # ============================================================
-# SIGN UP
+# SIGNUP
 # ============================================================
 
 @app.post("/signup")
@@ -492,20 +458,14 @@ def signup(
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Username must contain "
-                "at least 3 characters."
-            ),
+            detail="Username must contain at least 3 characters.",
         )
 
     if len(password) < 6:
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Password must contain "
-                "at least 6 characters."
-            ),
+            detail="Password must contain at least 6 characters.",
         )
 
     if username in USERS:
@@ -519,29 +479,19 @@ def signup(
 
     USERS[username] = {
 
-        "username":
-            username,
+        "username": username,
 
-        "email":
-            payload.email,
+        "email": payload.email,
 
-        "password_hash":
-            hash_password(password),
+        "password_hash": hash_password(password),
 
-        "token":
-            token,
+        "token": token,
 
-        "created_at":
-            int(time.time()),
+        "created_at": int(time.time()),
 
         "subscription": {
-
-            "status":
-                "inactive",
-
-            "plan":
-                None,
-
+            "status": "inactive",
+            "plan": None,
         },
 
     }
@@ -550,28 +500,23 @@ def signup(
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "message":
-            "Account created successfully.",
+        "message": "Account created successfully.",
 
-        "token":
-            token,
+        "token": token,
 
-        "next":
-            "payment",
+        "next": "payment",
 
-        "user":
-            serialize_user(
-                USERS[username]
-            ),
+        "user": serialize_user(
+            USERS[username]
+        ),
 
     }
 
 
 # ============================================================
-# SIGN IN
+# SIGNIN
 # ============================================================
 
 @app.post("/signin")
@@ -630,23 +575,17 @@ def signin(
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "message":
-            "Login successful.",
+        "message": "Login successful.",
 
-        "token":
-            token,
+        "token": token,
 
-        "username":
-            username,
+        "username": username,
 
-        "next":
-            next_page,
+        "next": next_page,
 
-        "user":
-            serialize_user(user),
+        "user": serialize_user(user),
 
     }
 
@@ -673,11 +612,9 @@ def logout(
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "message":
-            "Logged out successfully.",
+        "message": "Logged out successfully.",
 
     }
 
@@ -697,17 +634,15 @@ def profile(
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "user":
-            serialize_user(user),
+        "user": serialize_user(user),
 
     }
 
 
 # ============================================================
-# CREATE SUBSCRIPTION / RAZORPAY ORDER
+# SUBSCRIBE
 # ============================================================
 
 @app.post("/subscribe")
@@ -725,140 +660,137 @@ def subscribe(
         or {}
     )
 
-    # Already paid
+    # If already paid, go straight to dashboard.
     if subscription.get("status") == "active":
 
         return {
 
-            "status":
-                "already_active",
+            "status": "already_active",
 
-            "message":
-                "Your subscription is already active.",
+            "message": "Your subscription is already active.",
 
-            "next":
-                "dashboard",
+            "next": "dashboard",
 
-            "user":
-                serialize_user(user),
+            "user": serialize_user(user),
 
         }
 
-    plan = (payload.plan or "basic").strip().lower()
-
-    if plan not in PLAN_PRICES:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid subscription plan.",
-        )
-
-    amount = PLAN_PRICES[plan]
+    plan = (
+        payload.plan.strip()
+        or "pro"
+    )
 
     receipt = (
-
         f"sub-"
         f"{user['username']}-"
         f"{int(time.time())}-"
         f"{uuid.uuid4().hex[:8]}"
-
     )
 
     checkout = create_razorpay_order(
-        amount_rupees=amount,
+        amount_rupees=SUBSCRIPTION_AMOUNT,
         receipt=receipt,
     )
 
     order_id = checkout["id"]
 
-    # Store payment against user.
+    # Store payment using Razorpay order ID.
     PAYMENTS[order_id] = {
 
-        "order_id":
-            order_id,
+        "order_id": order_id,
 
-        "username":
-            user["username"],
+        "username": user["username"],
 
-        "plan":
-            plan,
+        "plan": plan,
 
-        "amount":
-            amount,
+        "amount": SUBSCRIPTION_AMOUNT,
 
-        "status":
-            "created",
+        "status": "created",
 
-        "created_at":
-            int(time.time()),
+        "created_at": int(time.time()),
 
     }
 
-    # Mark subscription pending.
+    # Mark subscription as pending.
     user["subscription"] = {
 
-        "status":
-            "pending",
+        "status": "pending",
 
-        "plan":
-            plan,
+        "plan": plan,
 
-        "order_id":
-            order_id,
+        "order_id": order_id,
 
     }
 
+    # Store pending payment.
     user["pending_payment"] = {
 
-        "order_id":
-            order_id,
+        "order_id": order_id,
 
-        "plan":
-            plan,
+        "plan": plan,
 
-        "amount":
-            amount,
+        "amount": SUBSCRIPTION_AMOUNT,
 
-        "created_at":
-            int(time.time()),
+        "created_at": int(time.time()),
 
     }
+
+    print(
+        "===================================="
+    )
+
+    print(
+        "RAZORPAY ORDER CREATED"
+    )
+
+    print(
+        "Username:",
+        user["username"]
+    )
+
+    print(
+        "Order ID:",
+        order_id
+    )
+
+    print(
+        "Amount:",
+        checkout["amount"]
+    )
+
+    print(
+        "===================================="
+    )
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "provider":
-            "razorpay",
+        "provider": "razorpay",
 
-        "message":
-            "Razorpay checkout created successfully.",
+        "message": (
+            "Razorpay checkout created successfully."
+        ),
 
-        "username":
-            user["username"],
+        "username": user["username"],
 
-        "email":
-            user.get("email"),
+        "email": user.get("email"),
 
-        "plan":
-            plan,
+        "plan": plan,
 
+        # IMPORTANT:
+        # No payment_event_id anymore.
         "checkout": {
 
-            "key":
-                RAZORPAY_KEY_ID,
+            "key": RAZORPAY_KEY_ID,
 
-            "order_id":
-                order_id,
+            "order_id": order_id,
 
-            "amount":
-                checkout["amount"],
+            "amount": checkout["amount"],
 
-            "currency":
-                checkout["currency"],
+            "currency": checkout["currency"],
 
-            "receipt":
-                checkout.get("receipt"),
+            "receipt": checkout.get("receipt"),
 
         },
 
@@ -866,15 +798,13 @@ def subscribe(
 
 
 # ============================================================
-# CONFIRM PAYMENT
+# PAYMENT CONFIRM
 # ============================================================
 
 @app.post("/payment-confirm")
 def payment_confirm(
     payload: PaymentConfirmRequest,
-
-    authorization: Optional[str] =
-        Header(None),
+    authorization: Optional[str] = Header(None),
 ):
 
     user = get_current_user(
@@ -893,6 +823,38 @@ def payment_confirm(
         payload.razorpay_signature
     )
 
+    print(
+        "===================================="
+    )
+
+    print(
+        "PAYMENT CONFIRM REQUEST"
+    )
+
+    print(
+        "Username:",
+        user["username"]
+    )
+
+    print(
+        "Payment ID:",
+        payment_id
+    )
+
+    print(
+        "Order ID:",
+        order_id
+    )
+
+    print(
+        "Signature received:",
+        bool(signature)
+    )
+
+    print(
+        "===================================="
+    )
+
     pending = (
         user.get("pending_payment")
     )
@@ -902,19 +864,20 @@ def payment_confirm(
         raise HTTPException(
             status_code=400,
             detail=(
-                "No pending payment "
-                "was found for this account."
+                "No pending payment was found "
+                "for this account."
             ),
         )
 
-    # Check order belongs to this user.
+    # Make sure order belongs to this user's
+    # pending payment.
     if pending.get("order_id") != order_id:
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "This payment does not "
-                "match the pending order."
+                "This payment does not match "
+                "the pending order."
             ),
         )
 
@@ -932,29 +895,27 @@ def payment_confirm(
         raise HTTPException(
             status_code=403,
             detail=(
-                "This payment does not "
-                "belong to this account."
+                "This payment does not belong "
+                "to this account."
             ),
         )
 
-    # Verify Razorpay signature.
+    # ========================================================
+    # VERIFY RAZORPAY SIGNATURE
+    # ========================================================
+
     valid = verify_razorpay_signature(
-
-        order_id=
-            order_id,
-
-        payment_id=
-            payment_id,
-
-        signature=
-            signature,
-
+        order_id=order_id,
+        payment_id=payment_id,
+        signature=signature,
     )
 
     if not valid:
 
-        payment["status"] = (
-            "verification_failed"
+        payment["status"] = "verification_failed"
+
+        print(
+            "RAZORPAY SIGNATURE VERIFICATION FAILED"
         )
 
         raise HTTPException(
@@ -964,43 +925,40 @@ def payment_confirm(
             ),
         )
 
+    # ========================================================
+    # PAYMENT VERIFIED
+    # ========================================================
+
     plan = (
         pending.get("plan")
         or "pro"
     )
 
-    # Activate subscription.
+    activation_time = int(
+        time.time()
+    )
+
     user["subscription"] = {
 
-        "status":
-            "active",
+        "status": "active",
 
-        "plan":
-            plan,
+        "plan": plan,
 
-        "payment_id":
-            payment_id,
+        "payment_id": payment_id,
 
-        "order_id":
-            order_id,
+        "order_id": order_id,
 
-        "activated_at":
-            int(time.time()),
+        "activated_at": activation_time,
 
     }
 
-    # Payment record.
     payment["status"] = "completed"
 
-    payment["payment_id"] = (
-        payment_id
-    )
+    payment["payment_id"] = payment_id
 
     payment["signature_verified"] = True
 
-    payment["confirmed_at"] = (
-        int(time.time())
-    )
+    payment["confirmed_at"] = activation_time
 
     # Remove pending payment.
     user.pop(
@@ -1008,31 +966,63 @@ def payment_confirm(
         None,
     )
 
+    print(
+        "===================================="
+    )
+
+    print(
+        "PAYMENT VERIFIED SUCCESSFULLY"
+    )
+
+    print(
+        "Username:",
+        user["username"]
+    )
+
+    print(
+        "Plan:",
+        plan
+    )
+
+    print(
+        "Payment ID:",
+        payment_id
+    )
+
+    print(
+        "Order ID:",
+        order_id
+    )
+
+    print(
+        "SUBSCRIPTION ACTIVE"
+    )
+
+    print(
+        "===================================="
+    )
+
+    # IMPORTANT:
+    # Frontend can immediately redirect
+    # to dashboard.
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "message":
-            (
-                "Payment verified successfully. "
-                "Your subscription is active."
-            ),
+        "message": (
+            "Payment verified successfully. "
+            "Your subscription is active."
+        ),
 
-        "next":
-            "dashboard",
+        "next": "dashboard",
 
-        "payment_id":
-            payment_id,
+        "payment_id": payment_id,
 
-        "order_id":
-            order_id,
+        "order_id": order_id,
 
-        "subscription":
-            user["subscription"],
+        "subscription": user["subscription"],
 
-        "user":
-            serialize_user(user),
+        "user": serialize_user(user),
 
     }
 
@@ -1047,11 +1037,9 @@ def admin_login(
 ):
 
     if (
-        payload.username
-        != ADMIN_USERNAME
+        payload.username != ADMIN_USERNAME
         or
-        payload.password
-        != ADMIN_PASSWORD
+        payload.password != ADMIN_PASSWORD
     ):
 
         raise HTTPException(
@@ -1061,23 +1049,24 @@ def admin_login(
 
     token = create_token()
 
-    ADMIN_TOKENS[token] = (
-        int(time.time())
+    ADMIN_TOKENS[token] = int(
+        time.time()
     )
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "token":
-            token,
+        "token": token,
 
-        "message":
-            "Admin login successful.",
+        "message": "Admin login successful.",
 
     }
 
+
+# ============================================================
+# ADMIN AUTH
+# ============================================================
 
 def admin_authorized(
     authorization: Optional[str],
@@ -1089,14 +1078,18 @@ def admin_authorized(
 
     return bool(
         token
-        and token in ADMIN_TOKENS
+        and
+        token in ADMIN_TOKENS
     )
 
 
+# ============================================================
+# ADMIN PAYMENTS
+# ============================================================
+
 @app.get("/admin/payments")
 def admin_payments(
-    authorization: Optional[str] =
-        Header(None),
+    authorization: Optional[str] = Header(None),
 ):
 
     if not admin_authorized(
@@ -1110,11 +1103,11 @@ def admin_payments(
 
     return {
 
-        "status":
-            "success",
+        "status": "success",
 
-        "payments":
-            list(PAYMENTS.values()),
+        "payments": list(
+            PAYMENTS.values()
+        ),
 
         "users": [
 
@@ -1127,9 +1120,7 @@ def admin_payments(
                     user.get("email"),
 
                 "subscription":
-                    user.get(
-                        "subscription"
-                    ),
+                    user.get("subscription"),
 
             }
 
@@ -1159,7 +1150,8 @@ def extract_value(
 
             if (
                 isinstance(current, dict)
-                and part in current
+                and
+                part in current
             ):
 
                 current = current[part]
@@ -1187,9 +1179,7 @@ def normalize_external_response(
         return {}
 
     ai_score = extract_value(
-
         response,
-
         [
             "ai_score",
             "ai.score",
@@ -1197,58 +1187,45 @@ def normalize_external_response(
             "ai_percentage",
             "ai.percent",
         ],
-
     )
 
     plag_score = extract_value(
-
         response,
-
         [
             "plagiarism_score",
             "plagiarism.score",
             "plag.score",
             "plagiarism_percentage",
         ],
-
     )
 
     ai_label = extract_value(
-
         response,
-
         [
             "ai_label",
             "ai.label",
             "label",
         ],
-
     )
 
     plag_label = extract_value(
-
         response,
-
         [
             "plagiarism_label",
             "plagiarism.label",
             "plag.label",
         ],
-
     )
 
     results = []
 
     raw_items = extract_value(
-
         response,
-
         [
             "paragraphs",
             "results",
             "items",
         ],
-
     ) or []
 
     if isinstance(
@@ -1324,6 +1301,7 @@ def normalize_external_response(
             return None
 
         try:
+
             return float(value)
 
         except (
@@ -1404,8 +1382,7 @@ def send_text_to_external_api(
         except json.JSONDecodeError:
 
             print(
-                "WARNING: "
-                "ANALYSIS_API_EXTRA "
+                "WARNING: ANALYSIS_API_EXTRA "
                 "is not valid JSON."
             )
 
@@ -1427,7 +1404,7 @@ def send_text_to_external_api(
 
 
 # ============================================================
-# ANALYZE DOCUMENT
+# ANALYZE INFO
 # ============================================================
 
 @app.get("/analyze")
@@ -1435,17 +1412,18 @@ def analyze_info():
 
     return {
 
-        "status":
-            "ok",
+        "status": "ok",
 
-        "message":
-            (
-                "POST a .docx file "
-                "to /analyze."
-            ),
+        "message": (
+            "POST a .docx file to /analyze."
+        ),
 
     }
 
+
+# ============================================================
+# ANALYZE DOCUMENT
+# ============================================================
 
 @app.post("/analyze")
 async def analyze_document(
@@ -1477,10 +1455,7 @@ async def analyze_document(
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Only .docx files "
-                "are supported."
-            ),
+            detail="Only .docx files are supported.",
         )
 
     if mode not in {
@@ -1510,11 +1485,8 @@ async def analyze_document(
     try:
 
         temp_file = NamedTemporaryFile(
-
             delete=False,
-
             suffix=".docx",
-
         )
 
         temp_file.write(
@@ -1590,11 +1562,8 @@ async def analyze_document(
         else:
 
             heuristic_results = analyze(
-
                 paragraphs,
-
                 use_openai=False,
-
             )
 
         constructed_results = []
@@ -1907,7 +1876,7 @@ def download_report(
 
 ):
 
-    # Payment gate.
+    # PAYMENT GATE
     get_active_user(
         authorization
     )
@@ -2055,7 +2024,7 @@ def health():
 
 
 # ============================================================
-# RUN
+# RUN SERVER
 # ============================================================
 
 if __name__ == "__main__":
@@ -2080,3 +2049,4 @@ if __name__ == "__main__":
         reload=False,
 
     )
+

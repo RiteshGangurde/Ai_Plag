@@ -56,6 +56,8 @@ export default function App() {
   const [error, setError] = useState(null)
   const [analysisMode, setAnalysisMode] = useState('ai')
   const [selectedPlan, setSelectedPlan] = useState('basic')
+  const [paymentMethod, setPaymentMethod] = useState('google_pay')
+  const [phoneNumber, setPhoneNumber] = useState('')
   const [subscriptionStatus, setSubscriptionStatus] = useState(null)
   const [subscribing, setSubscribing] = useState(false)
   const [adminUsername, setAdminUsername] = useState('')
@@ -75,6 +77,7 @@ export default function App() {
   const [authError, setAuthError] = useState(null)
   const [authMessage, setAuthMessage] = useState('')
   const [authUser, setAuthUser] = useState(null)
+  const [paymentEventId, setPaymentEventId] = useState(null)
   const [refreshingStatus, setRefreshingStatus] = useState(false)
   const [historyRecords, setHistoryRecords] = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
@@ -138,127 +141,198 @@ export default function App() {
     })
   }
 
-  const handleSubscribe = async (e) => {
-    e.preventDefault()
-    setSubscribing(true)
-    setError(null)
-    setSubscriptionStatus(null)
+ const handleSubscribe = async (e) => {
+  e.preventDefault()
+  setSubscribing(true)
+  setError(null)
+  setSubscriptionStatus(null)
 
-    if (!authToken) {
-      setError('Please sign in before subscribing to a plan.')
-      setSubscribing(false)
-      return
+  if (!authToken) {
+    setError('Please sign in before subscribing to a plan.')
+    setSubscribing(false)
+    return
+  }
+
+  try {
+    // 1. Create Razorpay order
+    const res = await fetch(buildApiUrl('/subscribe'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({
+        plan: selectedPlan,
+        payment_method: paymentMethod,
+        phone_number:
+          paymentMethod === 'phonepe' ? phoneNumber : undefined,
+      }),
+    })
+
+    const data = await parseJsonResponse(res)
+
+    if (!res.ok) {
+      throw new Error(
+        extractErrorMessage(data, 'Unable to start payment')
+      )
     }
 
-    try {
-      const res = await fetch(buildApiUrl('/subscribe'), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({ plan: selectedPlan }),
-      })
+    // 2. Make sure Razorpay order was created
+    if (
+      data.provider !== 'razorpay' ||
+      !data.checkout?.key ||
+      !data.checkout?.order_id
+    ) {
+      throw new Error(
+        'Unable to create Razorpay payment order. Please try again.'
+      )
+    }
 
-      const data = await parseJsonResponse(res)
-      if (!res.ok) {
-        throw new Error(extractErrorMessage(data, 'Unable to create payment.'))
-      }
+    // 3. Load Razorpay
+    await loadRazorpayScript()
 
-      // If the account is already active, go straight to the dashboard.
-      if (data.status === 'already_active') {
-        const updatedUser = await loadUserProfile(authToken)
-        setAuthUser(updatedUser || data.user)
-        setActiveNav('dashboard')
-        return
-      }
+    // 4. Open Razorpay checkout
+    const options = {
+      key: data.checkout.key,
+      amount: data.checkout.amount,
+      currency: data.checkout.currency,
+      name: 'AI Plag Detector',
+      description: `Subscription: ${data.plan}`,
+      order_id: data.checkout.order_id,
 
-      if (data.provider !== 'razorpay' || !data.checkout?.key || !data.checkout?.order_id) {
-        throw new Error('Razorpay checkout could not be created. Please try again.')
-      }
+      prefill: {
+        contact: data.phone_number || '',
+      },
 
-      await loadRazorpayScript()
+      theme: {
+        color: '#7C3AED',
+      },
 
-      const options = {
-        key: data.checkout.key,
-        amount: data.checkout.amount,
-        currency: data.checkout.currency,
-        name: 'AI Detection Analyzer',
-        description: `${data.plan} subscription`,
-        order_id: data.checkout.order_id,
-        prefill: {
-          name: authUser?.username || '',
-          email: authUser?.email || '',
-        },
-        theme: {
-          color: '#7C3AED',
-        },
-        handler: async function (response) {
-          try {
-            setSubscriptionStatus({
-              message: 'Payment received. Verifying payment…',
-              provider: 'razorpay',
-            })
+      // 5. Razorpay says payment succeeded
+      handler: async function (response) {
+        try {
+          console.log('Razorpay payment successful:', response)
 
-            const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
+          // 6. Send Razorpay details to backend
+          const verifyPayload = {
+            token: authToken,
+            plan: data.plan,
+            razorpay_payment_id:
+              response.razorpay_payment_id,
+            razorpay_order_id:
+              response.razorpay_order_id,
+            razorpay_signature:
+              response.razorpay_signature,
+          }
+
+          console.log(
+            '[verify-payment] sending:',
+            verifyPayload
+          )
+
+          const verifyRes = await fetch(
+            buildApiUrl('/verify-payment'),
+            {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${authToken}`,
               },
-              body: JSON.stringify({
-                razorpay_payment_id: response.razorpay_payment_id,
-                razorpay_order_id: response.razorpay_order_id,
-                razorpay_signature: response.razorpay_signature,
-              }),
-            })
-
-            const confirmData = await parseJsonResponse(confirmRes)
-            if (!confirmRes.ok) {
-              throw new Error(extractErrorMessage(confirmData, 'Payment verification failed.'))
+              body: JSON.stringify(verifyPayload),
             }
+          )
 
-            const updatedUser = await loadUserProfile(authToken)
+          const verifyData =
+            await parseJsonResponse(verifyRes)
 
-            if (updatedUser?.subscription?.status !== 'active') {
-              throw new Error('Payment was verified, but the subscription is not active yet. Please refresh and try again.')
-            }
+          if (!verifyRes.ok) {
+            throw new Error(
+              extractErrorMessage(
+                verifyData,
+                'Payment verification failed.'
+              )
+            )
+          }
 
-            setAuthUser(updatedUser)
+          console.log(
+            'Payment verified:',
+            verifyData
+          )
+
+          // 7. Payment is officially active
+          if (verifyData.status === 'success') {
             setSubscriptionStatus({
-              message: 'Payment successful! Your subscription is active.',
+              message:
+                'Payment successful! Your subscription is now active.',
+              method: data.payment_method,
               provider: 'razorpay',
             })
-            setError(null)
 
-            // Payment success → dashboard.
-            setActiveNav('dashboard')
-          } catch (err) {
-            console.error('[Razorpay] payment confirmation failed:', err)
-            setError(err.message)
-            setSubscriptionStatus(null)
+            // Save updated user information
+            try {
+              const updatedUser =
+                await loadUserProfile(authToken)
+
+              if (updatedUser) {
+                // If your app has a user state setter, use it here.
+                console.log(
+                  'Updated user:',
+                  updatedUser
+                )
+              }
+            } catch (profileError) {
+              console.warn(
+                'Could not refresh profile:',
+                profileError
+              )
+            }
+
+            // 8. GO DIRECTLY TO DASHBOARD
+            setTimeout(() => {
+              setActiveNav('dashboard')
+            }, 500)
           }
-        },
-        modal: {
-          ondismiss: () => {
-            setSubscriptionStatus(null)
-          },
-        },
-      }
+        } catch (err) {
+          console.error(
+            'Payment verification error:',
+            err
+          )
 
-      const razorpayInstance = new window.Razorpay(options)
-      razorpayInstance.on('payment.failed', (response) => {
-        const description = response?.error?.description || 'Razorpay payment failed.'
-        setError(description)
-        setSubscriptionStatus(null)
-      })
-      razorpayInstance.open()
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setSubscribing(false)
+          setError(
+            err.message ||
+              'Payment verification failed. Please contact support.'
+          )
+        }
+      },
+
+      // User closes Razorpay without completing payment
+      modal: {
+        ondismiss: function () {
+          console.log(
+            'Razorpay checkout closed by user'
+          )
+          setSubscribing(false)
+        },
+      },
     }
+
+    const razorpayInstance =
+      new window.Razorpay(options)
+
+    razorpayInstance.open()
+  } catch (err) {
+    console.error(
+      'Subscription error:',
+      err
+    )
+
+    setError(
+      err.message ||
+        'Unable to start subscription payment.'
+    )
+  } finally {
+    setSubscribing(false)
   }
+}
 
   const handleAdminLogin = async (e) => {
     e.preventDefault()
@@ -302,6 +376,28 @@ export default function App() {
     }
   }
 
+  const handleConfirmPayment = async (paymentEventId) => {
+    if (!adminToken) return
+    setAdminLoading(true)
+    setAdminError(null)
+    try {
+      const confirmPayload = { payment_event_id: paymentEventId, payment_id: `pay_${Date.now()}` }
+      console.log('[payment-confirm] sending payload:', confirmPayload)
+
+      const res = await fetch(buildApiUrl('/payment-confirm'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(confirmPayload),
+      })
+      const data = await parseJsonResponse(res)
+      if (!res.ok) throw new Error(extractErrorMessage(data, 'Confirmation failed'))
+      await fetchAdminPayments(adminToken)
+    } catch (err) {
+      setAdminError(err.message)
+    } finally {
+      setAdminLoading(false)
+    }
+  }
 
   const handleSignUp = async (e) => {
     e.preventDefault()
@@ -489,6 +585,7 @@ export default function App() {
   const handleLogout = () => {
     setAuthToken(null)
     setAuthUser(null)
+    setPaymentEventId(null)
     setSubscriptionStatus(null)
     setActiveNav('dashboard')
   }
@@ -583,7 +680,11 @@ export default function App() {
                             <div key={idx} className="paragraph-item" style={{ borderLeftColor: '#7C3AED' }}>
                               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
                                 <strong>{event.plan} — {event.status}</strong>
-
+                                {event.status !== 'completed' && (
+                                  <button className="btn-secondary" type="button" onClick={() => handleConfirmPayment(event.id)}>
+                                    Confirm
+                                  </button>
+                                )}
                               </div>
                               <div style={{ marginTop: 10, color: 'var(--text-muted)', fontSize: '0.95rem' }}>
                                 Order: {event.order_id}<br />
@@ -641,6 +742,15 @@ export default function App() {
                 <div className="info-box">
                   <div className="subscription-card">
                     <h4 style={{ marginBottom: 12 }}>💳 Subscription Plans</h4>
+                    <div style={{ marginBottom: 18, padding: 16, borderRadius: 16, background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(124,58,237,0.14)' }}>
+                      <div style={{ marginBottom: 10, fontWeight: 700 }}>UPI ID</div>
+                      <div style={{ marginBottom: 14, fontSize: '1.05rem', color: 'var(--primary-dark)', fontWeight: 800 }}>
+                        gogreensavepaper@ibl
+                      </div>
+                      <div style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                        Use the UPI ID above to pay for your selected plan. Your subscription is activated after payment confirmation.
+                      </div>
+                    </div>
                     <div className="plan-selector" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 18 }}>
                       {[
                         { id: 'basic', title: 'Basic', description: '2999 words', price: '₹599/-' },
@@ -670,14 +780,58 @@ export default function App() {
                       ))}
                     </div>
                     <form onSubmit={handleSubscribe} className="subscription-form">
-                      <p style={{ color: 'var(--text-muted)', marginBottom: 14 }}>
-                        Secure payment powered by Razorpay. You can use the payment methods available in Razorpay Checkout.
-                      </p>
+                      <div className="payment-options" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+                        <label className="payment-option">
+                          <input
+                            type="radio"
+                            name="payment_method"
+                            value="google_pay"
+                            checked={paymentMethod === 'google_pay'}
+                            onChange={(e) => setPaymentMethod(e.target.value)}
+                          />
+                          <span>Google Pay</span>
+                        </label>
+                        <label className="payment-option">
+                          <input
+                            type="radio"
+                            name="payment_method"
+                            value="phonepe"
+                            checked={paymentMethod === 'phonepe'}
+                            onChange={(e) => setPaymentMethod(e.target.value)}
+                          />
+                          <span>PhonePe</span>
+                        </label>
+                      </div>
+
+                      {paymentMethod === 'phonepe' && (
+                        <input
+                          type="tel"
+                          className="payment-input"
+                          placeholder="Enter phone number"
+                          value={phoneNumber}
+                          onChange={(e) => setPhoneNumber(e.target.value)}
+                          style={{ marginBottom: 12 }}
+                        />
+                      )}
 
                       <button type="submit" className="btn-submit" disabled={subscribing}>
                         {subscribing ? 'Processing…' : `Subscribe to ${selectedPlan.replace('_', ' ').replace(/\b\w/g, (x) => x.toUpperCase())}`}
                       </button>
                     </form>
+
+                    {subscriptionState?.status === 'pending' && (
+                      <div style={{ marginTop: 16, padding: 14, borderRadius: 12, background: 'rgba(249,115,22,0.1)', border: '1px solid rgba(249,115,22,0.3)' }}>
+                        <p style={{ fontWeight: 700, color: '#c2410c', marginBottom: 8 }}>
+                          Payment pending confirmation
+                        </p>
+                        <p style={{ color: 'var(--text-muted)', marginBottom: 10 }}>
+                          If you paid manually via UPI, this activates once confirmed. Already paid? Refresh your status below.
+                        </p>
+                        <button type="button" className="btn-secondary" onClick={handleRefreshSubscriptionStatus} disabled={refreshingStatus}>
+                          {refreshingStatus ? 'Checking…' : '🔄 I\u2019ve paid — Refresh status'}
+                        </button>
+                      </div>
+                    )}
 
                     {subscriptionStatus && (
                       <p style={{ marginTop: 12, color: '#15803d', fontWeight: 700 }}>
