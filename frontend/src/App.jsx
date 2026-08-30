@@ -170,6 +170,7 @@ export default function App() {
     })
 
     const data = await parseJsonResponse(res)
+    console.log('[subscribe] response received:', data)
 
     if (!res.ok) {
       throw new Error(
@@ -226,16 +227,17 @@ export default function App() {
           }
 
           console.log(
-            '[verify-payment] sending:',
+            '[payment-confirm] sending:',
             verifyPayload
           )
 
           const verifyRes = await fetch(
-            buildApiUrl('/verify-payment'),
+            buildApiUrl('/payment-confirm'),
             {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
+                Authorization: `Bearer ${authToken}`,
               },
               body: JSON.stringify(verifyPayload),
             }
