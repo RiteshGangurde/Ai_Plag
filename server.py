@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -108,6 +109,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_logger(request: Request, exc: RequestValidationError):
+    # Logs the exact raw body + which fields FastAPI considered missing/invalid,
+    # so a 422 can be diagnosed from the Railway logs instead of guessing.
+    try:
+        raw_body = await request.body()
+    except Exception:
+        raw_body = b""
+    print("====================================")
+    print(f"422 VALIDATION ERROR on {request.method} {request.url.path}")
+    print("Raw body received:", raw_body.decode("utf-8", errors="replace"))
+    print("Field errors:", json.dumps(exc.errors(), default=str))
+    print("====================================")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 # ============================================================
