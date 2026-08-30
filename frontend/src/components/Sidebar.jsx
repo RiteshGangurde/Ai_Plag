@@ -1,6 +1,6 @@
 import React from 'react'
 
-export default function Sidebar({ activeNav, setActiveNav }) {
+export default function Sidebar({ activeNav, setActiveNav, stage, onLogout, username }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-inner">
@@ -9,19 +9,25 @@ export default function Sidebar({ activeNav, setActiveNav }) {
         </div>
 
         <nav className="nav">
-          <button className={`nav-item ${activeNav==='dashboard'?'active':''}`} onClick={() => setActiveNav('dashboard')}>🏠 Dashboard</button>
-          <button className={`nav-item ${activeNav==='upload'?'active':''}`} onClick={() => setActiveNav('upload')}>📤 Upload</button>
-          <button className={`nav-item ${activeNav==='reports'?'active':''}`} onClick={() => setActiveNav('reports')}>📑 Reports</button>
-          <button className={`nav-item ${activeNav==='profile'?'active':''}`} onClick={() => setActiveNav('profile')}>👤 Profile</button>
-          <button className={`nav-item ${activeNav==='login'?'active':''}`} onClick={() => setActiveNav('login')}>🔐 Sign In / Sign Up</button>
-          <button className={`nav-item ${activeNav==='settings'?'active':''}`} onClick={() => setActiveNav('settings')}>⚙️ Settings</button>
-          <button className={`nav-item ${activeNav==='help'?'active':''}`} onClick={() => setActiveNav('help')}>❓ Help</button>
+          {stage === 'app' && (
+            <>
+              <button className={`nav-item ${activeNav === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveNav('dashboard')}>🏠 Dashboard</button>
+              <button className={`nav-item ${activeNav === 'profile' ? 'active' : ''}`} onClick={() => setActiveNav('profile')}>👤 Profile</button>
+            </>
+          )}
+
+          {stage === 'plans' && username && (
+            <div style={{ padding: '8px 14px', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+              Signed in as <strong>{username}</strong>
+            </div>
+          )}
         </nav>
 
-        <div className="sidebar-footer">
-          <button className="small-btn">Settings</button>
-          <button className="small-btn">Logout</button>
-        </div>
+        {(stage === 'app' || stage === 'plans') && (
+          <div className="sidebar-footer">
+            <button className="small-btn" onClick={onLogout}>Sign Out</button>
+          </div>
+        )}
       </div>
     </aside>
   )
