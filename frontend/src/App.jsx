@@ -31,6 +31,24 @@ const parseJsonResponse = async (res) => {
   }
 }
 
+// FastAPI errors aren't always plain strings — validation failures (422)
+// come back as an array of {loc, msg, type} objects, and some errors are
+// plain objects. Without this, those get stringified as "[object Object]".
+const extractErrorMessage = (data, fallback) => {
+  const detail = data?.detail
+  if (!detail) return fallback
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => (typeof item === 'string' ? item : item?.msg || JSON.stringify(item)))
+      .join('; ')
+  }
+  if (typeof detail === 'object') {
+    return detail.msg || JSON.stringify(detail)
+  }
+  return fallback
+}
+
 export default function App() {
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -59,6 +77,10 @@ export default function App() {
   const [authError, setAuthError] = useState(null)
   const [authMessage, setAuthMessage] = useState('')
   const [authUser, setAuthUser] = useState(null)
+  const [paymentEventId, setPaymentEventId] = useState(null)
+  const [refreshingStatus, setRefreshingStatus] = useState(false)
+  const [historyRecords, setHistoryRecords] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -75,6 +97,7 @@ export default function App() {
       const res = await fetch(buildApiUrl('/analyze'), {
         method: 'POST',
         body: fd,
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
       })
       if (!res.ok) {
         const body = await res.text()
@@ -139,7 +162,7 @@ export default function App() {
 
       const data = await parseJsonResponse(res)
       if (!res.ok) {
-        throw new Error(data.detail || 'Subscription request failed')
+        throw new Error(extractErrorMessage(data, 'Subscription request failed'))
       }
 
       setSubscriptionStatus({
@@ -147,6 +170,7 @@ export default function App() {
         method: data.payment_method,
         provider: data.provider,
       })
+      setPaymentEventId(data.payment_event_id || null)
 
       if (data.provider === 'razorpay' && data.checkout?.key && data.checkout?.order_id) {
         await loadRazorpayScript()
@@ -157,12 +181,45 @@ export default function App() {
           name: 'AI Plag Detector',
           description: `Subscription: ${data.plan}`,
           order_id: data.checkout.order_id,
-          handler: function () {
-            setSubscriptionStatus({
-              message: 'Payment completed successfully. Your subscription is now active.',
-              method: data.payment_method,
-              provider: data.provider,
-            })
+          handler: async function (response) {
+            try {
+              const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  payment_event_id: data.payment_event_id,
+                  payment_id: response?.razorpay_payment_id || `pay_${Date.now()}`,
+                  status: 'completed',
+                }),
+              })
+              const confirmData = await parseJsonResponse(confirmRes)
+              if (!confirmRes.ok) {
+                throw new Error(extractErrorMessage(confirmData, 'Payment confirmation failed on the server.'))
+              }
+
+              // Re-check the plan is actually active before redirecting.
+              // Retry a few times in case the database write hasn't
+              // propagated to a read yet.
+              let updatedUser = null
+              for (let attempt = 0; attempt < 5; attempt += 1) {
+                updatedUser = await loadUserProfile(authToken)
+                if (updatedUser?.subscription?.status === 'active') break
+                await new Promise((resolve) => setTimeout(resolve, 700))
+              }
+
+              if (updatedUser?.subscription?.status === 'active') {
+                setSubscriptionStatus({
+                  message: 'Payment completed successfully. Your subscription is now active.',
+                  method: data.payment_method,
+                  provider: data.provider,
+                })
+                setActiveNav('dashboard')
+              } else {
+                setError('Payment was recorded, but the plan is not showing as active yet. Click "I\u2019ve paid — Refresh status" in a moment to try again.')
+              }
+            } catch (err) {
+              setError(err.message)
+            }
           },
           prefill: {
             contact: data.phone_number || '',
@@ -194,7 +251,7 @@ export default function App() {
         body: JSON.stringify({ username: adminUsername, password: adminPassword }),
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || 'Login failed')
+      if (!res.ok) throw new Error(extractErrorMessage(data, 'Login failed'))
       setAdminToken(data.token)
       setAdminError(null)
       setAdminUsername('')
@@ -215,7 +272,7 @@ export default function App() {
         headers: { Authorization: `Bearer ${token}` },
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || 'Could not fetch payments')
+      if (!res.ok) throw new Error(extractErrorMessage(data, 'Could not fetch payments'))
       setAdminPayments(data.payments || [])
     } catch (err) {
       setAdminError(err.message)
@@ -235,7 +292,7 @@ export default function App() {
         body: JSON.stringify({ payment_event_id: paymentEventId, payment_id: `pay_${Date.now()}` }),
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || 'Confirmation failed')
+      if (!res.ok) throw new Error(extractErrorMessage(data, 'Confirmation failed'))
       await fetchAdminPayments(adminToken)
     } catch (err) {
       setAdminError(err.message)
@@ -254,7 +311,7 @@ export default function App() {
         body: JSON.stringify({ username: authUsername, password: authPassword, email: authEmail }),
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || data.message || 'Signup failed')
+      if (!res.ok) throw new Error(extractErrorMessage(data, data.message || 'Signup failed'))
       setAuthToken(data.token)
       setAuthUser(data.user || { username: authUsername, email: authEmail })
       setAuthMode('signin')
@@ -279,7 +336,7 @@ export default function App() {
         body: JSON.stringify({ username: authUsername, password: authPassword }),
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || data.message || 'Signin failed')
+      if (!res.ok) throw new Error(extractErrorMessage(data, data.message || 'Signin failed'))
       setAuthToken(data.token)
       setAuthUser(data.user || { username: authUsername })
       setAuthError(null)
@@ -363,20 +420,22 @@ export default function App() {
   const [activeNav, setActiveNav] = useState('upload')
 
   const loadUserProfile = async (token) => {
-    if (!token) return
+    if (!token) return null
     try {
       const res = await fetch(buildApiUrl('/profile'), {
         headers: { Authorization: `Bearer ${token}` },
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || 'Unable to load profile')
+      if (!res.ok) throw new Error(extractErrorMessage(data, 'Unable to load profile'))
       setAuthUser(data.user || null)
       if (data.user?.username) {
         setAuthUsername('')
         setAuthPassword('')
       }
+      return data.user || null
     } catch (err) {
       setAuthError(err.message)
+      return null
     }
   }
 
@@ -390,6 +449,66 @@ export default function App() {
     }
   }, [authToken])
 
+  const handleRefreshSubscriptionStatus = async () => {
+    if (!authToken) return
+    setRefreshingStatus(true)
+    try {
+      const updatedUser = await loadUserProfile(authToken)
+      if (updatedUser?.subscription?.status === 'active') {
+        setActiveNav('dashboard')
+      }
+    } finally {
+      setRefreshingStatus(false)
+    }
+  }
+
+  const loadHistory = async () => {
+    if (!authToken) return
+    setHistoryLoading(true)
+    try {
+      const res = await fetch(buildApiUrl('/history'), {
+        headers: { Authorization: `Bearer ${authToken}` },
+      })
+      const data = await parseJsonResponse(res)
+      if (res.ok) setHistoryRecords(data.history || [])
+    } catch {
+      // Non-critical — leave history empty on failure.
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (activeNav === 'profile' && authToken) {
+      loadHistory()
+    }
+  }, [activeNav, authToken])
+
+  const handleLogout = () => {
+    setAuthToken(null)
+    setAuthUser(null)
+    setPaymentEventId(null)
+    setSubscriptionStatus(null)
+    setActiveNav('dashboard')
+  }
+
+  // Gate the app into three stages:
+  // 1. "auth"  — no signed-in user yet, must sign in / sign up
+  // 2. "plans" — signed in, but no active (paid + confirmed) subscription yet
+  // 3. "app"   — signed in and subscribed, full dashboard/upload access
+  const subscriptionState = authUser?.subscription
+  const appStage = !authToken || !authUser
+    ? 'auth'
+    : subscriptionState?.status !== 'active'
+      ? 'plans'
+      : 'app'
+
+  useEffect(() => {
+    if (appStage === 'app' && (activeNav === 'login' || activeNav === 'plans')) {
+      setActiveNav('dashboard')
+    }
+  }, [appStage])
+
   return (
     <div className="app">
       <header className="header">
@@ -400,7 +519,13 @@ export default function App() {
       </header>
 
       <div className="layout">
-        <Sidebar activeNav={activeNav} setActiveNav={setActiveNav} />
+        <Sidebar
+          activeNav={activeNav}
+          setActiveNav={setActiveNav}
+          stage={appStage}
+          onLogout={handleLogout}
+          username={authUser?.username}
+        />
 
         <main className="main">
           <div className="container">
@@ -476,9 +601,12 @@ export default function App() {
                   </div>
                 )}
               </section>
-            ) : activeNav === 'login' ? (
+            ) : appStage === 'auth' ? (
               <section className="auth-section">
                 <h3>{authMode === 'signin' ? 'Sign In' : 'Sign Up'}</h3>
+                <p style={{ color: 'var(--text-muted)', marginBottom: 12 }}>
+                  Sign in or create an account to choose a plan and start analyzing documents.
+                </p>
                 <form onSubmit={authMode === 'signin' ? handleSignIn : handleSignUp} style={{ display: 'grid', gap: 12, maxWidth: 420 }}>
                   {authMode === 'signup' && (
                     <label>
@@ -504,6 +632,121 @@ export default function App() {
                 {authError && <p style={{ color: '#b91c1c' }}>{authError}</p>}
                 {authMessage && <p style={{ color: '#15803d' }}>{authMessage}</p>}
               </section>
+            ) : appStage === 'plans' ? (
+              <section className="upload-section">
+                <div className="upload-card" style={{ marginBottom: 24 }}>
+                  <h2>Choose Your Plan</h2>
+                  <p style={{ color: 'var(--text-muted)' }}>
+                    Hi {authUser?.username}, select a plan and complete payment to unlock document uploads.
+                  </p>
+                </div>
+
+                <div className="info-box">
+                  <div className="subscription-card">
+                    <h4 style={{ marginBottom: 12 }}>💳 Subscription Plans</h4>
+                    <div style={{ marginBottom: 18, padding: 16, borderRadius: 16, background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(124,58,237,0.14)' }}>
+                      <div style={{ marginBottom: 10, fontWeight: 700 }}>UPI ID</div>
+                      <div style={{ marginBottom: 14, fontSize: '1.05rem', color: 'var(--primary-dark)', fontWeight: 800 }}>
+                        gogreensavepaper@ibl
+                      </div>
+                      <div style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                        Use the UPI ID above to pay for your selected plan. Your subscription is activated after payment confirmation.
+                      </div>
+                    </div>
+                    <div className="plan-selector" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 18 }}>
+                      {[
+                        { id: 'basic', title: 'Basic', description: '2999 words', price: '₹599/-' },
+                        { id: 'premium', title: 'Premium', description: '7999 words', price: '₹1499/-' },
+                        { id: 'premium_pro', title: 'Premium Pro', description: '10000 words', price: '₹1999/-' },
+                      ].map((plan) => (
+                        <button
+                          key={plan.id}
+                          type="button"
+                          className={`plan-card ${selectedPlan === plan.id ? 'active' : ''}`}
+                          onClick={() => setSelectedPlan(plan.id)}
+                          style={{
+                            padding: '1rem',
+                            borderRadius: '16px',
+                            border: selectedPlan === plan.id ? '2px solid var(--primary)' : '1px solid rgba(124,58,237,0.18)',
+                            background: selectedPlan === plan.id ? 'rgba(124,58,237,0.1)' : 'white',
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                            minHeight: '120px',
+                            transition: 'all 0.2s ease',
+                          }}
+                        >
+                          <div style={{ fontSize: '1rem', fontWeight: 700, marginBottom: 6 }}>{plan.title}</div>
+                          <div style={{ color: 'var(--text-muted)', marginBottom: 14 }}>{plan.description}</div>
+                          <div style={{ fontSize: '1.1rem', fontWeight: 800 }}>{plan.price}</div>
+                        </button>
+                      ))}
+                    </div>
+                    <form onSubmit={handleSubscribe} className="subscription-form">
+                      <div className="payment-options" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+                        <label className="payment-option">
+                          <input
+                            type="radio"
+                            name="payment_method"
+                            value="google_pay"
+                            checked={paymentMethod === 'google_pay'}
+                            onChange={(e) => setPaymentMethod(e.target.value)}
+                          />
+                          <span>Google Pay</span>
+                        </label>
+                        <label className="payment-option">
+                          <input
+                            type="radio"
+                            name="payment_method"
+                            value="phonepe"
+                            checked={paymentMethod === 'phonepe'}
+                            onChange={(e) => setPaymentMethod(e.target.value)}
+                          />
+                          <span>PhonePe</span>
+                        </label>
+                      </div>
+
+                      {paymentMethod === 'phonepe' && (
+                        <input
+                          type="tel"
+                          className="payment-input"
+                          placeholder="Enter phone number"
+                          value={phoneNumber}
+                          onChange={(e) => setPhoneNumber(e.target.value)}
+                          style={{ marginBottom: 12 }}
+                        />
+                      )}
+
+                      <button type="submit" className="btn-submit" disabled={subscribing}>
+                        {subscribing ? 'Processing…' : `Subscribe to ${selectedPlan.replace('_', ' ').replace(/\b\w/g, (x) => x.toUpperCase())}`}
+                      </button>
+                    </form>
+
+                    {subscriptionState?.status === 'pending' && (
+                      <div style={{ marginTop: 16, padding: 14, borderRadius: 12, background: 'rgba(249,115,22,0.1)', border: '1px solid rgba(249,115,22,0.3)' }}>
+                        <p style={{ fontWeight: 700, color: '#c2410c', marginBottom: 8 }}>
+                          Payment pending confirmation
+                        </p>
+                        <p style={{ color: 'var(--text-muted)', marginBottom: 10 }}>
+                          If you paid manually via UPI, this activates once confirmed. Already paid? Refresh your status below.
+                        </p>
+                        <button type="button" className="btn-secondary" onClick={handleRefreshSubscriptionStatus} disabled={refreshingStatus}>
+                          {refreshingStatus ? 'Checking…' : '🔄 I\u2019ve paid — Refresh status'}
+                        </button>
+                      </div>
+                    )}
+
+                    {subscriptionStatus && (
+                      <p style={{ marginTop: 12, color: '#15803d', fontWeight: 700 }}>
+                        {subscriptionStatus.message}
+                      </p>
+                    )}
+                    {error && <p style={{ marginTop: 8, color: '#b91c1c', fontWeight: 700 }}>{error}</p>}
+                    <p style={{ marginTop: 14, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.6 }}>
+                      Terms and conditions apply. No profit business.
+                    </p>
+                  </div>
+                </div>
+              </section>
             ) : activeNav === 'profile' ? (
               <section className="profile-view">
                 <div className="details-section">
@@ -514,11 +757,37 @@ export default function App() {
                       <div style={{ fontSize: 20, fontWeight: 800 }}>{authUser?.username || 'Your Profile'}</div>
                       <div style={{ color: 'var(--text-muted)', marginTop: 6 }}>{authUser?.email || 'No email provided yet'}</div>
                       {authMessage && <div style={{ marginTop: 8, color: '#15803d' }}>{authMessage}</div>}
-                      <div style={{ marginTop: 12 }}>
-                        <button className="btn-secondary">Edit Profile</button>
-                      </div>
                     </div>
                   </div>
+                  <div style={{ marginTop: 20, padding: 16, borderRadius: 16, background: 'rgba(124,58,237,0.08)' }}>
+                    <div style={{ fontWeight: 700, marginBottom: 4 }}>Current Plan</div>
+                    <div style={{ textTransform: 'capitalize' }}>
+                      {(subscriptionState?.plan || 'none').replace('_', ' ')} — {subscriptionState?.status || 'inactive'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="details-section" style={{ marginTop: 20 }}>
+                  <h4>Recent Analyses</h4>
+                  {historyLoading ? (
+                    <p style={{ color: 'var(--text-muted)' }}>Loading…</p>
+                  ) : historyRecords.length === 0 ? (
+                    <p style={{ color: 'var(--text-muted)' }}>No documents analyzed yet.</p>
+                  ) : (
+                    <div style={{ display: 'grid', gap: 10, marginTop: 10 }}>
+                      {historyRecords.map((record) => (
+                        <div key={record.id} className="paragraph-item" style={{ borderLeftColor: '#7C3AED' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10 }}>
+                            <strong>{record.filename}</strong>
+                            <span>{record.mode === 'plagiarism' ? 'Plagiarism' : 'AI'} — {record.overall_score}%</span>
+                          </div>
+                          <div style={{ marginTop: 6, color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                            {new Date(record.created_at * 1000).toLocaleString()}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </section>
             ) : (
@@ -699,91 +968,12 @@ export default function App() {
               Backend endpoint: <code>/analyze</code> (FastAPI wrapper around analyze_docx.py).
             </p>
             <div className="subscription-card" style={{ marginTop: 18 }}>
-              <h4 style={{ marginBottom: 12 }}>💳 Subscription Plans</h4>
-              <div style={{ marginBottom: 18, padding: 16, borderRadius: 16, background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(124,58,237,0.14)' }}>
-                <div style={{ marginBottom: 10, fontWeight: 700 }}>UPI ID</div>
-                <div style={{ marginBottom: 14, fontSize: '1.05rem', color: 'var(--primary-dark)', fontWeight: 800 }}>
-                  gogreensavepaper@ibl
-                </div>
-                <div style={{ color: 'var(--text-muted)', lineHeight: 1.6 }}>
-                  Use the UPI ID above to pay for your selected plan. Your subscription is activated after payment confirmation.
+              <h4 style={{ marginBottom: 12 }}>💳 Your Plan</h4>
+              <div style={{ padding: 16, borderRadius: 16, background: 'rgba(255,255,255,0.92)', border: '1px solid rgba(124,58,237,0.14)' }}>
+                <div style={{ fontWeight: 800, fontSize: '1.05rem', color: 'var(--primary-dark)', textTransform: 'capitalize' }}>
+                  {(subscriptionState?.plan || 'basic').replace('_', ' ')} plan — Active ✅
                 </div>
               </div>
-              <div className="plan-selector" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 18 }}>
-                {[
-                  { id: 'basic', title: 'Basic', description: '2999 words', price: '₹599/-' },
-                  { id: 'premium', title: 'Premium', description: '7999 words', price: '₹1499/-' },
-                  { id: 'premium_pro', title: 'Premium Pro', description: '10000 words', price: '₹1999/-' },
-                ].map((plan) => (
-                  <button
-                    key={plan.id}
-                    type="button"
-                    className={`plan-card ${selectedPlan === plan.id ? 'active' : ''}`}
-                    onClick={() => setSelectedPlan(plan.id)}
-                    style={{
-                      padding: '1rem',
-                      borderRadius: '16px',
-                      border: selectedPlan === plan.id ? '2px solid var(--primary)' : '1px solid rgba(124,58,237,0.18)',
-                      background: selectedPlan === plan.id ? 'rgba(124,58,237,0.1)' : 'white',
-                      cursor: 'pointer',
-                      textAlign: 'left',
-                      minHeight: '120px',
-                      transition: 'all 0.2s ease',
-                    }}
-                  >
-                    <div style={{ fontSize: '1rem', fontWeight: 700, marginBottom: 6 }}>{plan.title}</div>
-                    <div style={{ color: 'var(--text-muted)', marginBottom: 14 }}>{plan.description}</div>
-                    <div style={{ fontSize: '1.1rem', fontWeight: 800 }}>{plan.price}</div>
-                  </button>
-                ))}
-              </div>
-              <form onSubmit={handleSubscribe} className="subscription-form">
-                <div className="payment-options" style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
-                  <label className="payment-option">
-                    <input
-                      type="radio"
-                      name="payment_method"
-                      value="google_pay"
-                      checked={paymentMethod === 'google_pay'}
-                      onChange={(e) => setPaymentMethod(e.target.value)}
-                    />
-                    <span>Google Pay</span>
-                  </label>
-                  <label className="payment-option">
-                    <input
-                      type="radio"
-                      name="payment_method"
-                      value="phonepe"
-                      checked={paymentMethod === 'phonepe'}
-                      onChange={(e) => setPaymentMethod(e.target.value)}
-                    />
-                    <span>PhonePe</span>
-                  </label>
-                </div>
-
-                {paymentMethod === 'phonepe' && (
-                  <input
-                    type="tel"
-                    className="payment-input"
-                    placeholder="Enter phone number"
-                    value={phoneNumber}
-                    onChange={(e) => setPhoneNumber(e.target.value)}
-                    style={{ marginBottom: 12 }}
-                  />
-                )}
-
-                <button type="submit" className="btn-submit" disabled={subscribing}>
-                  {subscribing ? 'Processing…' : `Subscribe to ${selectedPlan.replace('_', ' ').replace(/\b\w/g, (x) => x.toUpperCase())}`}
-                </button>
-              </form>
-              {subscriptionStatus && (
-                <p style={{ marginTop: 12, color: '#15803d', fontWeight: 700 }}>
-                  {subscriptionStatus.message}
-                </p>
-              )}
-              <p style={{ marginTop: 14, color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.6 }}>
-                Terms and conditions apply. No profit business.
-              </p>
             </div>
             {externalError && (
               <p style={{ marginTop: 8, color: '#b91c1c', fontWeight: 700 }}>
