@@ -86,12 +86,22 @@ def find_user_by_token(token: str) -> Optional[Dict[str, Any]]:
 def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not user:
         return None
+    subscription = user.get('subscription') or {'status': 'inactive', 'plan': None}
     return {
         'username': user.get('username'),
         'email': user.get('email'),
         'token': user.get('token'),
         'created_at': user.get('created_at'),
+        'subscription': subscription,
     }
+
+
+def set_user_subscription(username: str, subscription: Dict[str, Any]) -> None:
+    users = get_user_collection()
+    if users is not None:
+        users.update_one({'username': username}, {'$set': {'subscription': subscription}})
+    elif username in USERS:
+        USERS[username]['subscription'] = subscription
 
 
 class SubscribeRequest(BaseModel):
@@ -146,7 +156,7 @@ def cleanup_temp_file(path: str) -> None:
         pass
 
 
-def create_payment_event(plan: str, payment_method: str, provider: str, order_id: str, phone_number: Optional[str] = None) -> Dict[str, Any]:
+def create_payment_event(plan: str, payment_method: str, provider: str, order_id: str, phone_number: Optional[str] = None, username: Optional[str] = None) -> Dict[str, Any]:
     event = {
         "id": str(uuid.uuid4()),
         "plan": plan,
@@ -157,6 +167,7 @@ def create_payment_event(plan: str, payment_method: str, provider: str, order_id
         "status": "pending",
         "message": "Payment requested by user.",
         "created_at": int(time.time()),
+        "username": username,
     }
     PAYMENT_EVENTS.append(event)
     return event
@@ -363,6 +374,14 @@ def payment_confirm(payload: PaymentConfirmRequest):
     target["message"] = "Payment received and confirmed by the system."
     target["confirmed_at"] = int(time.time())
 
+    if target.get("username") and payload.status == "completed":
+        set_user_subscription(target["username"], {
+            "status": "active",
+            "plan": target.get("plan"),
+            "payment_event_id": target["id"],
+            "activated_at": target["confirmed_at"],
+        })
+
     return {
         "status": "success",
         "message": "Payment confirmed and admin notified.",
@@ -507,7 +526,7 @@ async def analyze_document(
 
 
 @app.post("/subscribe")
-def subscribe(payload: SubscribeRequest):
+def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(None)):
     payment_method = payload.payment_method.lower()
     if payment_method not in ALLOWED_PAYMENT_METHODS:
         raise HTTPException(status_code=400, detail="Unsupported payment method. Use google_pay or phonepe.")
@@ -515,9 +534,37 @@ def subscribe(payload: SubscribeRequest):
     if payment_method == "phonepe" and not payload.phone_number:
         raise HTTPException(status_code=400, detail="PhonePe checkout requires a phone number.")
 
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Sign in before subscribing to a plan.")
+
+    token = authorization.replace("Bearer ", "", 1)
+    user = find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
+
+    username = user.get("username")
+
     amount = float(os.getenv("SUBSCRIPTION_AMOUNT", "499"))
     receipt = f"sub-{int(time.time())}"
     checkout = create_razorpay_order(amount=amount, receipt=receipt)
+    provider = "razorpay" if checkout else "demo"
+
+    event = create_payment_event(
+        plan=payload.plan,
+        payment_method=payment_method,
+        provider=provider,
+        order_id=checkout.get("id") if checkout else receipt,
+        phone_number=payload.phone_number,
+        username=username,
+    )
+
+    # Mark the user's subscription as pending until payment is confirmed
+    # (via Razorpay success callback, or admin confirmation for manual UPI payments).
+    set_user_subscription(username, {
+        "status": "pending",
+        "plan": payload.plan,
+        "payment_event_id": event["id"],
+    })
 
     if checkout:
         return {
@@ -527,6 +574,7 @@ def subscribe(payload: SubscribeRequest):
             "plan": payload.plan,
             "payment_method": payment_method,
             "phone_number": payload.phone_number,
+            "payment_event_id": event["id"],
             "checkout": {
                 "key": os.getenv("RAZORPAY_KEY_ID"),
                 "order_id": checkout.get("id"),
@@ -539,10 +587,11 @@ def subscribe(payload: SubscribeRequest):
     return {
         "status": "success",
         "provider": "demo",
-        "message": f"Subscription request received for {payload.plan} plan using {payment_method}. Add Razorpay credentials to enable live payment checkout.",
+        "message": f"Subscription request received for {payload.plan} plan using {payment_method}. Pay via the UPI ID shown, then wait for confirmation.",
         "plan": payload.plan,
         "payment_method": payment_method,
         "phone_number": payload.phone_number,
+        "payment_event_id": event["id"],
     }
 
 
