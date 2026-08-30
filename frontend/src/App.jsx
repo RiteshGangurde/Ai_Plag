@@ -183,14 +183,23 @@ export default function App() {
           order_id: data.checkout.order_id,
           handler: async function (response) {
             try {
+              if (!data.payment_event_id) {
+                throw new Error(
+                  'No payment_event_id was returned from /subscribe, so the payment cannot be confirmed. Please retry subscribing.'
+                )
+              }
+
+              const confirmPayload = {
+                payment_event_id: data.payment_event_id,
+                payment_id: response?.razorpay_payment_id || `pay_${Date.now()}`,
+                status: 'completed',
+              }
+              console.log('[payment-confirm] sending payload:', confirmPayload)
+
               const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  payment_event_id: data.payment_event_id,
-                  payment_id: response?.razorpay_payment_id || `pay_${Date.now()}`,
-                  status: 'completed',
-                }),
+                body: JSON.stringify(confirmPayload),
               })
               const confirmData = await parseJsonResponse(confirmRes)
               if (!confirmRes.ok) {
@@ -286,10 +295,13 @@ export default function App() {
     setAdminLoading(true)
     setAdminError(null)
     try {
+      const confirmPayload = { payment_event_id: paymentEventId, payment_id: `pay_${Date.now()}` }
+      console.log('[payment-confirm] sending payload:', confirmPayload)
+
       const res = await fetch(buildApiUrl('/payment-confirm'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ payment_event_id: paymentEventId, payment_id: `pay_${Date.now()}` }),
+        body: JSON.stringify(confirmPayload),
       })
       const data = await parseJsonResponse(res)
       if (!res.ok) throw new Error(extractErrorMessage(data, 'Confirmation failed'))

@@ -9,7 +9,8 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional
 import uuid
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 import io
@@ -121,17 +122,6 @@ class PaymentConfirmRequest(BaseModel):
     status: str = "completed"
 
 
-class AdminLoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class PaymentConfirmRequest(BaseModel):
-    payment_event_id: str
-    payment_id: str
-    status: str = "completed"
-
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -139,6 +129,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_logger(request: Request, exc: RequestValidationError):
+    # Log the exact body + field errors so a 422 can be diagnosed from the
+    # Railway logs instead of guessing from the browser console.
+    try:
+        raw_body = await request.body()
+    except Exception:
+        raw_body = b""
+    print("====================================")
+    print(f"422 VALIDATION ERROR on {request.method} {request.url.path}")
+    print("Raw body received:", raw_body.decode("utf-8", errors="replace"))
+    print("Field errors:", json.dumps(exc.errors(), default=str))
+    print("====================================")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 def write_temp_docx(file_bytes: bytes) -> str:
