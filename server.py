@@ -43,7 +43,7 @@ PLAN_PRICES: Dict[str, float] = {
     "premium": float(os.getenv("PLAN_PRICE_PREMIUM", "1499")),
     "premium_pro": float(os.getenv("PLAN_PRICE_PREMIUM_PRO", "1999")),
 }
-DEFAULT_PLAN_PRICE = float(os.getenv("SUBSCRIPTION_AMOUNT", "499"))
+
 
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
