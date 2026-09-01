@@ -1,21 +1,23 @@
+import hashlib
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import json
 import time
-import uuid
-import hmac
-import hashlib
-import secrets
+import requests
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, List, Optional
+import uuid
 
-import requests
-from dotenv import load_dotenv
-
-from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse, Response
+import io
+
 from pydantic import BaseModel
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
 
 from analyze_docx import (
     analyze,
@@ -27,109 +29,230 @@ from analyze_docx import (
 
 from report_generator import generate_report_pdf
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-load_dotenv()
-
 app = FastAPI(
-    title="AI Plag Analyzer",
-    description="AI plagiarism detector with login and Razorpay subscription.",
+    title="AI Plag Analyzer Backend",
+    description="Accepts Word document uploads and returns AI + plagiarism analysis results.",
 )
 
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
+ALLOWED_PAYMENT_METHODS = {"google_pay", "phonepe"}
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+# Rupee amount charged per plan. Override any of these via env vars if needed,
+# e.g. PLAN_PRICE_PREMIUM_PRO=2499
+PLAN_PRICES: Dict[str, float] = {
+    "basic": float(os.getenv("PLAN_PRICE_BASIC", "499")),
+    "premium": float(os.getenv("PLAN_PRICE_PREMIUM", "1499")),
+    "premium_pro": float(os.getenv("PLAN_PRICE_PREMIUM_PRO", "1999")),
+}
+DEFAULT_PLAN_PRICE = float(os.getenv("SUBSCRIPTION_AMOUNT", "499"))
 
-try:
-    SUBSCRIPTION_AMOUNT = int(
-        float(os.getenv("SUBSCRIPTION_AMOUNT", "499"))
-    )
-except ValueError:
-    SUBSCRIPTION_AMOUNT = 499
-
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-
-ANALYSIS_API_URL = os.getenv("ANALYSIS_API_URL", "").strip()
-ANALYSIS_API_KEY = os.getenv("ANALYSIS_API_KEY", "").strip()
-ANALYSIS_API_EXTRA = os.getenv("ANALYSIS_API_EXTRA", "").strip()
-
-
-# ============================================================
-# SIMPLE IN-MEMORY STORAGE
-# ============================================================
-#
-# NO MONGODB
-#
-# IMPORTANT:
-# Railway restart/redeploy will clear this data.
-# For your current MVP this keeps the backend extremely simple.
-#
-# If you later need permanent users/subscriptions, we can add
-# a database after the payment flow is completely stable.
-# ============================================================
-
+ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
+ADMIN_SESSION_TOKENS: Dict[str, Dict[str, Any]] = {}
+PAYMENT_EVENTS: List[Dict[str, Any]] = []
 USERS: Dict[str, Dict[str, Any]] = {}
 
-TOKENS: Dict[str, str] = {}
+DEFAULT_MONGODB_URI = 'mongodb+srv://prajayfaldesai987_db_user:hGsIgjrHhhZV0A2X@cluster0.6agqfbt.mongodb.net/?appName=Cluster0'
+MONGODB_URI = os.getenv('MONGODB_URI', DEFAULT_MONGODB_URI)
+MONGODB_DB_NAME = os.getenv('MONGODB_DB', 'ai_plag_analyzer')
+mongo_client = None
+mongo_db = None
 
-PAYMENTS: Dict[str, Dict[str, Any]] = {}
+try:
+    mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.server_info()
+    mongo_db = mongo_client[MONGODB_DB_NAME]
+    mongo_db['users'].create_index('username', unique=True)
+except PyMongoError:
+    mongo_client = None
+    mongo_db = None
 
-ADMIN_TOKENS: Dict[str, int] = {}
+
+def get_user_collection():
+    return mongo_db['users'] if mongo_db is not None else None
 
 
-# ============================================================
-# CORS
-# ============================================================
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
-if FRONTEND_URL == "*":
 
-    allowed_origins = ["*"]
-    allow_credentials = False
+def find_user(username: str) -> Optional[Dict[str, Any]]:
+    users = get_user_collection()
+    if users is not None:
+        return users.find_one({'username': username})
+    return USERS.get(username)
 
-else:
 
-    allowed_origins = [
-        item.strip()
-        for item in FRONTEND_URL.split(",")
-        if item.strip()
-    ]
+def find_user_by_token(token: str) -> Optional[Dict[str, Any]]:
+    users = get_user_collection()
+    if users is not None:
+        return users.find_one({'token': token})
+    for user in USERS.values():
+        if user.get('token') == token:
+            return user
+    return None
 
-    allow_credentials = True
+
+def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not user:
+        return None
+    return {
+        'username': user.get('username'),
+        'email': user.get('email'),
+        'token': user.get('token'),
+        'created_at': user.get('created_at'),
+    }
+
+
+class SubscribeRequest(BaseModel):
+    plan: str = "basic"
+    payment_method: str
+    phone_number: Optional[str] = None
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PaymentConfirmRequest(BaseModel):
+    payment_event_id: str
+    payment_id: str
+    status: str = "completed"
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PaymentConfirmRequest(BaseModel):
+    payment_event_id: str
+    payment_id: str
+    status: str = "completed"
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=allow_credentials,
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.exception_handler(RequestValidationError)
-async def validation_error_logger(request: Request, exc: RequestValidationError):
-    # Logs the exact raw body + which fields FastAPI considered missing/invalid,
-    # so a 422 can be diagnosed from the Railway logs instead of guessing.
+def write_temp_docx(file_bytes: bytes) -> str:
+    temp_file = NamedTemporaryFile(delete=False, suffix=".docx")
+    temp_file.write(file_bytes)
+    temp_file.flush()
+    temp_file.close()
+    return temp_file.name
+
+
+def cleanup_temp_file(path: str) -> None:
     try:
-        raw_body = await request.body()
-    except Exception:
-        raw_body = b""
-    print("====================================")
-    print(f"422 VALIDATION ERROR on {request.method} {request.url.path}")
-    print("Raw body received:", raw_body.decode("utf-8", errors="replace"))
-    print("Field errors:", json.dumps(exc.errors(), default=str))
-    print("====================================")
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+        os.remove(path)
+    except OSError:
+        pass
 
 
-# ============================================================
-# REQUEST MODELS
-# ============================================================
+def create_payment_event(plan: str, payment_method: str, provider: str, order_id: str, phone_number: Optional[str] = None) -> Dict[str, Any]:
+    event = {
+        "id": str(uuid.uuid4()),
+        "plan": plan,
+        "payment_method": payment_method,
+        "provider": provider,
+        "order_id": order_id,
+        "phone_number": phone_number,
+        "status": "pending",
+        "message": "Payment requested by user.",
+        "created_at": int(time.time()),
+    }
+    PAYMENT_EVENTS.append(event)
+    return event
+
+
+def admin_authorized(authorization: Optional[str]) -> bool:
+    if not authorization:
+        return False
+    token = authorization.replace("Bearer ", "", 1)
+    return token in ADMIN_SESSION_TOKENS
+
+
+def create_razorpay_order(amount: int, receipt: str) -> Optional[Dict[str, Any]]:
+    key_id = os.getenv("RAZORPAY_KEY_ID")
+    key_secret = os.getenv("RAZORPAY_KEY_SECRET")
+
+    print("Razorpay Key ID loaded:", bool(key_id))
+    print("Razorpay Secret loaded:", bool(key_secret))
+
+    if not key_id or not key_secret:
+        print("Razorpay credentials are missing.")
+        return None
+
+    payload = {
+        "amount": int(amount * 100),
+        "currency": "INR",
+        "receipt": receipt,
+    }
+
+    response = requests.post(
+        "https://api.razorpay.com/v1/orders",
+        auth=(key_id, key_secret),
+        json=payload,
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def send_text_to_external_api(text: str) -> Optional[Dict[str, Any]]:
+    """Send the extracted document text to your paid API provider.
+
+    Replace the body of this function with the exact request your API requires.
+    The code below is a generic starting point using JSON POST and bearer auth.
+    """
+    api_url = os.getenv("ANALYSIS_API_URL")
+    api_key = os.getenv("ANALYSIS_API_KEY")
+    if not api_url:
+        return None
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    body = {
+        "text": text,
+        "features": ["plagiarism", "ai_detection"],
+    }
+
+    extra_fields = os.getenv("ANALYSIS_API_EXTRA")
+    if extra_fields:
+        try:
+            body.update(json.loads(extra_fields))
+        except json.JSONDecodeError:
+            pass
+
+    response = requests.post(api_url, json=body, headers=headers, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+@app.post("/admin/login")
+def admin_login(payload: AdminLoginRequest):
+    if payload.username != ADMIN_USERNAME or payload.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
+
+    token = str(uuid.uuid4())
+    ADMIN_SESSION_TOKENS[token] = {
+        "username": payload.username,
+        "created_at": int(time.time()),
+    }
+    return {
+        "status": "success",
+        "token": token,
+        "message": "Admin login successful.",
+    }
+
 
 class SignupRequest(BaseModel):
     username: str
@@ -142,1928 +265,364 @@ class SigninRequest(BaseModel):
     password: str
 
 
-class SubscribeRequest(BaseModel):
-    plan: str = "pro"
-    payment_method: str = "razorpay"
-    phone_number: Optional[str] = None
-
-
-class PaymentConfirmRequest(BaseModel):
-    razorpay_payment_id: str
-    razorpay_order_id: str
-    razorpay_signature: str
-
-
-class AdminLoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-# ============================================================
-# PASSWORD HASHING
-# ============================================================
-
-def hash_password(password: str) -> str:
-
-    salt = secrets.token_bytes(16)
-
-    derived = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        200_000,
-    )
-
-    return (
-        "pbkdf2_sha256$200000$"
-        + salt.hex()
-        + "$"
-        + derived.hex()
-    )
-
-
-def verify_password(
-    password: str,
-    stored_hash: str,
-) -> bool:
-
-    try:
-
-        parts = stored_hash.split("$")
-
-        if len(parts) != 4:
-            return False
-
-        algorithm = parts[0]
-        iterations = int(parts[1])
-        salt = bytes.fromhex(parts[2])
-        expected = bytes.fromhex(parts[3])
-
-        if algorithm != "pbkdf2_sha256":
-            return False
-
-        actual = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt,
-            iterations,
-        )
-
-        return hmac.compare_digest(
-            actual,
-            expected,
-        )
-
-    except Exception:
-
-        return False
-
-
-# ============================================================
-# TOKEN FUNCTIONS
-# ============================================================
-
-def create_token() -> str:
-
-    return secrets.token_urlsafe(32)
-
-
-def extract_bearer_token(
-    authorization: Optional[str],
-) -> Optional[str]:
-
-    if not authorization:
-        return None
-
-    token = authorization.strip()
-
-    if token.lower().startswith("bearer "):
-
-        token = token[7:].strip()
-
-    return token or None
-
-
-def get_user_from_token(
-    token: Optional[str],
-) -> Optional[Dict[str, Any]]:
-
-    if not token:
-        return None
-
-    username = TOKENS.get(token)
-
-    if not username:
-        return None
-
-    return USERS.get(username)
-
-
-def get_current_user(
-    authorization: Optional[str],
-) -> Dict[str, Any]:
-
-    token = extract_bearer_token(
-        authorization
-    )
-
-    user = get_user_from_token(token)
-
-    if not user:
-
-        raise HTTPException(
-            status_code=401,
-            detail="Please sign in again.",
-        )
-
-    return user
-
-
-def get_active_user(
-    authorization: Optional[str],
-) -> Dict[str, Any]:
-
-    user = get_current_user(
-        authorization
-    )
-
-    subscription = (
-        user.get("subscription")
-        or {}
-    )
-
-    if subscription.get("status") != "active":
-
-        raise HTTPException(
-            status_code=402,
-            detail=(
-                "Active subscription required. "
-                "Please complete payment first."
-            ),
-        )
-
-    return user
-
-
-# ============================================================
-# USER SERIALIZATION
-# ============================================================
-
-def serialize_user(
-    user: Optional[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-
-    if not user:
-        return None
-
-    subscription = (
-        user.get("subscription")
-        or {
-            "status": "inactive",
-            "plan": None,
-        }
-    )
-
-    return {
-
-        "username": user.get("username"),
-
-        "email": user.get("email"),
-
-        "created_at": user.get("created_at"),
-
-        "subscription": subscription,
-
-    }
-
-
-# ============================================================
-# RAZORPAY ORDER CREATION
-# ============================================================
-
-def create_razorpay_order(
-    amount_rupees: int,
-    receipt: str,
-) -> Dict[str, Any]:
-
-    if not RAZORPAY_KEY_ID:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "RAZORPAY_KEY_ID is missing "
-                "from Railway environment variables."
-            ),
-        )
-
-    if not RAZORPAY_KEY_SECRET:
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "RAZORPAY_KEY_SECRET is missing "
-                "from Railway environment variables."
-            ),
-        )
-
-    payload = {
-        "amount": int(amount_rupees * 100),
-        "currency": "INR",
-        "receipt": receipt,
-    }
-
-    try:
-
-        response = requests.post(
-            "https://api.razorpay.com/v1/orders",
-            auth=(
-                RAZORPAY_KEY_ID,
-                RAZORPAY_KEY_SECRET,
-            ),
-            json=payload,
-            timeout=20,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not data.get("id"):
-
-            raise HTTPException(
-                status_code=502,
-                detail="Razorpay did not return an order ID.",
-            )
-
-        return data
-
-    except requests.HTTPError as exc:
-
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-
-        print(
-            "===================================="
-        )
-        print("RAZORPAY ORDER ERROR")
-        print(detail)
-        print(
-            "===================================="
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Razorpay order creation failed: {detail}",
-        ) from exc
-
-    except requests.RequestException as exc:
-
-        print(
-            "RAZORPAY CONNECTION ERROR:",
-            repr(exc),
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to Razorpay.",
-        ) from exc
-
-
-# ============================================================
-# RAZORPAY SIGNATURE VERIFICATION
-# ============================================================
-
-def verify_razorpay_signature(
-    order_id: str,
-    payment_id: str,
-    signature: str,
-) -> bool:
-
-    if not RAZORPAY_KEY_SECRET:
-        return False
-
-    message = f"{order_id}|{payment_id}"
-
-    expected_signature = hmac.new(
-        RAZORPAY_KEY_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    return hmac.compare_digest(
-        expected_signature,
-        signature,
-    )
-
-
-# ============================================================
-# SIGNUP
-# ============================================================
-
 @app.post("/signup")
-def signup(
-    payload: SignupRequest,
-):
+def signup(payload: SignupRequest):
+    if not payload.username or not payload.password:
+        raise HTTPException(status_code=400, detail="username and password are required")
 
-    username = payload.username.strip()
-
-    password = payload.password
-
-    if len(username) < 3:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Username must contain at least 3 characters.",
-        )
-
-    if len(password) < 6:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Password must contain at least 6 characters.",
-        )
-
-    if username in USERS:
-
-        raise HTTPException(
-            status_code=400,
-            detail="User already exists.",
-        )
-
-    token = create_token()
-
-    USERS[username] = {
-
-        "username": username,
-
-        "email": payload.email,
-
-        "password_hash": hash_password(password),
-
-        "token": token,
-
-        "created_at": int(time.time()),
-
-        "subscription": {
-            "status": "inactive",
-            "plan": None,
-        },
-
-    }
-
-    TOKENS[token] = username
+    users = get_user_collection()
+    if users is not None:
+        if users.find_one({'username': payload.username}):
+            raise HTTPException(status_code=400, detail="User already exists")
+        token = str(uuid.uuid4())
+        users.insert_one({
+            'username': payload.username,
+            'email': payload.email,
+            'password_hash': hash_password(payload.password),
+            'token': token,
+            'created_at': int(time.time()),
+        })
+    else:
+        if payload.username in USERS:
+            raise HTTPException(status_code=400, detail="User already exists")
+        token = str(uuid.uuid4())
+        USERS[payload.username] = {
+            'username': payload.username,
+            'email': payload.email,
+            'password': payload.password,
+            'token': token,
+            'created_at': int(time.time()),
+        }
 
     return {
-
         "status": "success",
-
-        "message": "Account created successfully.",
-
+        "message": "User created successfully",
         "token": token,
-
-        "next": "payment",
-
-        "user": serialize_user(
-            USERS[username]
-        ),
-
+        "user": serialize_user({
+            'username': payload.username,
+            'email': payload.email,
+            'token': token,
+            'created_at': int(time.time()),
+        }),
     }
 
-
-# ============================================================
-# SIGNIN
-# ============================================================
 
 @app.post("/signin")
-def signin(
-    payload: SigninRequest,
-):
+def signin(payload: SigninRequest):
+    if not payload.username or not payload.password:
+        raise HTTPException(status_code=400, detail="username and password are required")
 
-    username = payload.username.strip()
-
-    user = USERS.get(username)
-
+    user = find_user(payload.username)
     if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid username or password.",
-        )
+    password_hash = hash_password(payload.password)
+    expected_hash = user.get('password_hash')
+    if expected_hash:
+        if expected_hash != password_hash:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+    elif user.get('password') != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    if not verify_password(
-        payload.password,
-        user["password_hash"],
-    ):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid username or password.",
-        )
-
-    old_token = user.get("token")
-
-    if old_token:
-
-        TOKENS.pop(
-            old_token,
-            None,
-        )
-
-    token = create_token()
-
-    user["token"] = token
-
-    TOKENS[token] = username
-
-    subscription = (
-        user.get("subscription")
-        or {}
-    )
-
-    if subscription.get("status") == "active":
-
-        next_page = "dashboard"
-
+    token = str(uuid.uuid4())
+    user['token'] = token
+    users = get_user_collection()
+    if users is not None:
+        users.update_one({'username': payload.username}, {'$set': {'token': token}})
     else:
-
-        next_page = "payment"
+        user['token'] = token
 
     return {
-
         "status": "success",
-
-        "message": "Login successful.",
-
+        "message": "Login successful",
         "token": token,
-
-        "username": username,
-
-        "next": next_page,
-
+        "username": user.get("username"),
         "user": serialize_user(user),
-
     }
 
-
-# ============================================================
-# LOGOUT
-# ============================================================
-
-@app.post("/logout")
-def logout(
-    authorization: Optional[str] = Header(None),
-):
-
-    token = extract_bearer_token(
-        authorization
-    )
-
-    if token:
-
-        TOKENS.pop(
-            token,
-            None,
-        )
-
-    return {
-
-        "status": "success",
-
-        "message": "Logged out successfully.",
-
-    }
-
-
-# ============================================================
-# PROFILE
-# ============================================================
 
 @app.get("/profile")
-def profile(
-    authorization: Optional[str] = Header(None),
-):
+def profile(authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
 
-    user = get_current_user(
-        authorization
-    )
+    token = authorization.replace("Bearer ", "", 1)
+    user = find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    return {
+    return {"status": "success", "message": "Profile loaded", "user": serialize_user(user)}
 
-        "status": "success",
-
-        "user": serialize_user(user),
-
-    }
-
-
-# ============================================================
-# SUBSCRIBE
-# ============================================================
-
-@app.post("/subscribe")
-def subscribe(
-    payload: SubscribeRequest,
-    authorization: Optional[str] = Header(None),
-):
-
-    user = get_current_user(
-        authorization
-    )
-
-    subscription = (
-        user.get("subscription")
-        or {}
-    )
-
-    # If already paid, go straight to dashboard.
-    if subscription.get("status") == "active":
-
-        return {
-
-            "status": "already_active",
-
-            "message": "Your subscription is already active.",
-
-            "next": "dashboard",
-
-            "user": serialize_user(user),
-
-        }
-
-    plan = (
-        payload.plan.strip()
-        or "pro"
-    )
-
-    receipt = (
-        f"sub-"
-        f"{user['username']}-"
-        f"{int(time.time())}-"
-        f"{uuid.uuid4().hex[:8]}"
-    )
-
-    checkout = create_razorpay_order(
-        amount_rupees=SUBSCRIPTION_AMOUNT,
-        receipt=receipt,
-    )
-
-    order_id = checkout["id"]
-
-    # Store payment using Razorpay order ID.
-    PAYMENTS[order_id] = {
-
-        "order_id": order_id,
-
-        "username": user["username"],
-
-        "plan": plan,
-
-        "amount": SUBSCRIPTION_AMOUNT,
-
-        "status": "created",
-
-        "created_at": int(time.time()),
-
-    }
-
-    # Mark subscription as pending.
-    user["subscription"] = {
-
-        "status": "pending",
-
-        "plan": plan,
-
-        "order_id": order_id,
-
-    }
-
-    # Store pending payment.
-    user["pending_payment"] = {
-
-        "order_id": order_id,
-
-        "plan": plan,
-
-        "amount": SUBSCRIPTION_AMOUNT,
-
-        "created_at": int(time.time()),
-
-    }
-
-    print(
-        "===================================="
-    )
-
-    print(
-        "RAZORPAY ORDER CREATED"
-    )
-
-    print(
-        "Username:",
-        user["username"]
-    )
-
-    print(
-        "Order ID:",
-        order_id
-    )
-
-    print(
-        "Amount:",
-        checkout["amount"]
-    )
-
-    print(
-        "===================================="
-    )
-
-    return {
-
-        "status": "success",
-
-        "provider": "razorpay",
-
-        "message": (
-            "Razorpay checkout created successfully."
-        ),
-
-        "username": user["username"],
-
-        "email": user.get("email"),
-
-        "plan": plan,
-
-        # IMPORTANT:
-        # No payment_event_id anymore.
-        "checkout": {
-
-            "key": RAZORPAY_KEY_ID,
-
-            "order_id": order_id,
-
-            "amount": checkout["amount"],
-
-            "currency": checkout["currency"],
-
-            "receipt": checkout.get("receipt"),
-
-        },
-
-    }
-
-
-# ============================================================
-# PAYMENT CONFIRM
-# ============================================================
-
-@app.post("/payment-confirm")
-def payment_confirm(
-    payload: PaymentConfirmRequest,
-    authorization: Optional[str] = Header(None),
-):
-
-    user = get_current_user(
-        authorization
-    )
-
-    payment_id = (
-        payload.razorpay_payment_id
-    )
-
-    order_id = (
-        payload.razorpay_order_id
-    )
-
-    signature = (
-        payload.razorpay_signature
-    )
-
-    print(
-        "===================================="
-    )
-
-    print(
-        "PAYMENT CONFIRM REQUEST"
-    )
-
-    print(
-        "Username:",
-        user["username"]
-    )
-
-    print(
-        "Payment ID:",
-        payment_id
-    )
-
-    print(
-        "Order ID:",
-        order_id
-    )
-
-    print(
-        "Signature received:",
-        bool(signature)
-    )
-
-    print(
-        "===================================="
-    )
-
-    pending = (
-        user.get("pending_payment")
-    )
-
-    if not pending:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No pending payment was found "
-                "for this account."
-            ),
-        )
-
-    # Make sure order belongs to this user's
-    # pending payment.
-    if pending.get("order_id") != order_id:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "This payment does not match "
-                "the pending order."
-            ),
-        )
-
-    payment = PAYMENTS.get(order_id)
-
-    if not payment:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Payment order not found.",
-        )
-
-    if payment.get("username") != user["username"]:
-
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "This payment does not belong "
-                "to this account."
-            ),
-        )
-
-    # ========================================================
-    # VERIFY RAZORPAY SIGNATURE
-    # ========================================================
-
-    valid = verify_razorpay_signature(
-        order_id=order_id,
-        payment_id=payment_id,
-        signature=signature,
-    )
-
-    if not valid:
-
-        payment["status"] = "verification_failed"
-
-        print(
-            "RAZORPAY SIGNATURE VERIFICATION FAILED"
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Razorpay payment verification failed."
-            ),
-        )
-
-    # ========================================================
-    # PAYMENT VERIFIED
-    # ========================================================
-
-    plan = (
-        pending.get("plan")
-        or "pro"
-    )
-
-    activation_time = int(
-        time.time()
-    )
-
-    user["subscription"] = {
-
-        "status": "active",
-
-        "plan": plan,
-
-        "payment_id": payment_id,
-
-        "order_id": order_id,
-
-        "activated_at": activation_time,
-
-    }
-
-    payment["status"] = "completed"
-
-    payment["payment_id"] = payment_id
-
-    payment["signature_verified"] = True
-
-    payment["confirmed_at"] = activation_time
-
-    # Remove pending payment.
-    user.pop(
-        "pending_payment",
-        None,
-    )
-
-    print(
-        "===================================="
-    )
-
-    print(
-        "PAYMENT VERIFIED SUCCESSFULLY"
-    )
-
-    print(
-        "Username:",
-        user["username"]
-    )
-
-    print(
-        "Plan:",
-        plan
-    )
-
-    print(
-        "Payment ID:",
-        payment_id
-    )
-
-    print(
-        "Order ID:",
-        order_id
-    )
-
-    print(
-        "SUBSCRIPTION ACTIVE"
-    )
-
-    print(
-        "===================================="
-    )
-
-    # IMPORTANT:
-    # Frontend can immediately redirect
-    # to dashboard.
-    return {
-
-        "status": "success",
-
-        "message": (
-            "Payment verified successfully. "
-            "Your subscription is active."
-        ),
-
-        "next": "dashboard",
-
-        "payment_id": payment_id,
-
-        "order_id": order_id,
-
-        "subscription": user["subscription"],
-
-        "user": serialize_user(user),
-
-    }
-
-
-# ============================================================
-# ADMIN LOGIN
-# ============================================================
-
-@app.post("/admin/login")
-def admin_login(
-    payload: AdminLoginRequest,
-):
-
-    if (
-        payload.username != ADMIN_USERNAME
-        or
-        payload.password != ADMIN_PASSWORD
-    ):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin credentials.",
-        )
-
-    token = create_token()
-
-    ADMIN_TOKENS[token] = int(
-        time.time()
-    )
-
-    return {
-
-        "status": "success",
-
-        "token": token,
-
-        "message": "Admin login successful.",
-
-    }
-
-
-# ============================================================
-# ADMIN AUTH
-# ============================================================
-
-def admin_authorized(
-    authorization: Optional[str],
-) -> bool:
-
-    token = extract_bearer_token(
-        authorization
-    )
-
-    return bool(
-        token
-        and
-        token in ADMIN_TOKENS
-    )
-
-
-# ============================================================
-# ADMIN PAYMENTS
-# ============================================================
 
 @app.get("/admin/payments")
-def admin_payments(
-    authorization: Optional[str] = Header(None),
-):
+def admin_payments(authorization: Optional[str] = Header(None)):
+    if not admin_authorized(authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return {"status": "success", "payments": PAYMENT_EVENTS}
 
-    if not admin_authorized(
-        authorization
-    ):
 
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized.",
-        )
+@app.post("/payment-confirm")
+def payment_confirm(payload: PaymentConfirmRequest):
+    target = next((item for item in PAYMENT_EVENTS if item["id"] == payload.payment_event_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Payment event not found")
+
+    target["status"] = payload.status
+    target["payment_id"] = payload.payment_id
+    target["message"] = "Payment received and confirmed by the system."
+    target["confirmed_at"] = int(time.time())
 
     return {
-
         "status": "success",
-
-        "payments": list(
-            PAYMENTS.values()
-        ),
-
-        "users": [
-
-            {
-
-                "username":
-                    user["username"],
-
-                "email":
-                    user.get("email"),
-
-                "subscription":
-                    user.get("subscription"),
-
-            }
-
-            for user in USERS.values()
-
-        ],
-
+        "message": "Payment confirmed and admin notified.",
+        "payment_event": target,
     }
 
 
-# ============================================================
-# EXTERNAL AI API
-# ============================================================
-
-def extract_value(
-    response: Dict[str, Any],
-    paths: List[str],
-) -> Optional[Any]:
-
+def extract_value(response: Dict[str, Any], paths: List[str]) -> Optional[Any]:
     for path in paths:
-
         parts = path.split(".")
-
         current = response
-
         for part in parts:
-
-            if (
-                isinstance(current, dict)
-                and
-                part in current
-            ):
-
+            if isinstance(current, dict) and part in current:
                 current = current[part]
-
             else:
-
                 break
-
         else:
-
             return current
-
     return None
 
 
-def normalize_external_response(
-    response: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    if not isinstance(
-        response,
-        dict,
-    ):
-
+def normalize_external_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(response, dict):
         return {}
 
-    ai_score = extract_value(
-        response,
-        [
-            "ai_score",
-            "ai.score",
-            "score",
-            "ai_percentage",
-            "ai.percent",
-        ],
-    )
-
-    plag_score = extract_value(
-        response,
-        [
-            "plagiarism_score",
-            "plagiarism.score",
-            "plag.score",
-            "plagiarism_percentage",
-        ],
-    )
-
-    ai_label = extract_value(
-        response,
-        [
-            "ai_label",
-            "ai.label",
-            "label",
-        ],
-    )
-
-    plag_label = extract_value(
-        response,
-        [
-            "plagiarism_label",
-            "plagiarism.label",
-            "plag.label",
-        ],
-    )
+    ai_score = extract_value(response, ["ai_score", "ai.score", "score", "ai_percentage", "ai.percent"])
+    plag_score = extract_value(response, ["plagiarism_score", "plagiarism.score", "plag.score", "plagiarism_percentage"])
+    ai_label = extract_value(response, ["ai_label", "ai.label", "label"])
+    plag_label = extract_value(response, ["plagiarism_label", "plagiarism.label", "plag.label"])
 
     results = []
-
-    raw_items = extract_value(
-        response,
-        [
-            "paragraphs",
-            "results",
-            "items",
-        ],
-    ) or []
-
-    if isinstance(
-        raw_items,
-        list,
-    ):
-
+    raw_items = extract_value(response, ["paragraphs", "results", "items"]) or []
+    if isinstance(raw_items, list):
         for item in raw_items:
-
-            if not isinstance(
-                item,
-                dict,
-            ):
-
+            if not isinstance(item, dict):
                 continue
-
             results.append({
-
-                "ai_score":
-                    extract_value(
-                        item,
-                        [
-                            "ai_score",
-                            "ai.score",
-                            "score",
-                        ],
-                    ),
-
-                "plagiarism_score":
-                    extract_value(
-                        item,
-                        [
-                            "plagiarism_score",
-                            "plagiarism.score",
-                            "plag.score",
-                        ],
-                    ),
-
-                "ai_label":
-                    extract_value(
-                        item,
-                        [
-                            "ai_label",
-                            "ai.label",
-                            "label",
-                        ],
-                    ),
-
-                "plagiarism_label":
-                    extract_value(
-                        item,
-                        [
-                            "plagiarism_label",
-                            "plagiarism.label",
-                        ],
-                    ),
-
-                "reason":
-                    extract_value(
-                        item,
-                        [
-                            "reason",
-                            "explanation",
-                            "details",
-                        ],
-                    ),
-
+                "ai_score": extract_value(item, ["ai_score", "ai.score", "score"]),
+                "plagiarism_score": extract_value(item, ["plagiarism_score", "plagiarism.score", "plag.score"]),
+                "ai_label": extract_value(item, ["ai_label", "ai.label", "label"]),
+                "plagiarism_label": extract_value(item, ["plagiarism_label", "plagiarism.label"]),
+                "reason": extract_value(item, ["reason", "explanation", "details"]),
             })
 
-    def safe_float(value):
-
-        if value is None:
-            return None
-
-        try:
-
-            return float(value)
-
-        except (
-            ValueError,
-            TypeError,
-        ):
-
-            return None
-
     return {
-
-        "ai_score":
-            safe_float(ai_score),
-
-        "plagiarism_score":
-            safe_float(plag_score),
-
-        "ai_label":
-            ai_label,
-
-        "plagiarism_label":
-            plag_label,
-
-        "items":
-            results,
-
+        "ai_score": float(ai_score) if ai_score is not None else None,
+        "plagiarism_score": float(plag_score) if plag_score is not None else None,
+        "ai_label": ai_label,
+        "plagiarism_label": plag_label,
+        "items": results,
     }
 
-
-def send_text_to_external_api(
-    text: str,
-) -> Optional[Dict[str, Any]]:
-
-    if not ANALYSIS_API_URL:
-
-        return None
-
-    headers = {
-
-        "Content-Type":
-            "application/json",
-
-    }
-
-    if ANALYSIS_API_KEY:
-
-        headers["Authorization"] = (
-            f"Bearer {ANALYSIS_API_KEY}"
-        )
-
-    body = {
-
-        "text":
-            text,
-
-        "features": [
-            "plagiarism",
-            "ai_detection",
-        ],
-
-    }
-
-    if ANALYSIS_API_EXTRA:
-
-        try:
-
-            extra = json.loads(
-                ANALYSIS_API_EXTRA
-            )
-
-            if isinstance(
-                extra,
-                dict,
-            ):
-
-                body.update(extra)
-
-        except json.JSONDecodeError:
-
-            print(
-                "WARNING: ANALYSIS_API_EXTRA "
-                "is not valid JSON."
-            )
-
-    response = requests.post(
-
-        ANALYSIS_API_URL,
-
-        json=body,
-
-        headers=headers,
-
-        timeout=60,
-
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-# ============================================================
-# ANALYZE INFO
-# ============================================================
 
 @app.get("/analyze")
 def analyze_info():
-
     return {
-
         "status": "ok",
-
-        "message": (
-            "POST a .docx file to /analyze."
-        ),
-
+        "message": "Use POST /analyze with a multipart/form-data file upload to analyze a .docx document.",
     }
 
-
-# ============================================================
-# ANALYZE DOCUMENT
-# ============================================================
 
 @app.post("/analyze")
 async def analyze_document(
-
     file: UploadFile = File(...),
-
-    mode: str = Form("ai"),
-
-    authorization: Optional[str] =
-        Header(None),
-
+    mode: str = Form('ai'),
 ):
+    if not file.filename.lower().endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Only .docx files are supported")
 
-    # PAYMENT GATE
-    user = get_active_user(
-        authorization
-    )
-
-    if not file.filename:
-
-        raise HTTPException(
-            status_code=400,
-            detail="No file was selected.",
-        )
-
-    if not file.filename.lower().endswith(
-        ".docx"
-    ):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Only .docx files are supported.",
-        )
-
-    if mode not in {
-        "ai",
-        "plagiarism",
-    }:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid analysis mode. "
-                "Use ai or plagiarism."
-            ),
-        )
+    if mode not in {"ai", "plagiarism"}:
+        raise HTTPException(status_code=400, detail="Invalid analysis mode. Use ai or plagiarism.")
 
     file_bytes = await file.read()
-
-    if not file_bytes:
-
-        raise HTTPException(
-            status_code=400,
-            detail="The uploaded file is empty.",
-        )
-
-    temp_path = None
+    temp_path = write_temp_docx(file_bytes)
 
     try:
-
-        temp_file = NamedTemporaryFile(
-            delete=False,
-            suffix=".docx",
-        )
-
-        temp_file.write(
-            file_bytes
-        )
-
-        temp_file.flush()
-
-        temp_file.close()
-
-        temp_path = temp_file.name
-
-        paragraphs = load_paragraphs(
-            temp_path
-        )
-
+        paragraphs = load_paragraphs(temp_path)
         if not paragraphs:
+            raise HTTPException(status_code=400, detail="The uploaded document contains no readable paragraphs.")
 
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "The uploaded document "
-                    "contains no readable paragraphs."
-                ),
-            )
-
-        document_text = "\n\n".join(
-
-            paragraph["text"]
-
-            for paragraph in paragraphs
-
-        )
-
+        document_text = "\n\n".join(p["text"] for p in paragraphs)
         external_data = None
-
         external_error = None
 
         try:
-
-            raw_response = (
-                send_text_to_external_api(
-                    document_text
-                )
-            )
-
+            raw_response = send_text_to_external_api(document_text)
             if raw_response:
-
-                external_data = (
-                    normalize_external_response(
-                        raw_response
-                    )
-                )
-
+                external_data = normalize_external_response(raw_response)
         except Exception as exc:
-
             external_error = str(exc)
 
-            print(
-                "EXTERNAL API ERROR:",
-                repr(exc),
-            )
-
-        # Local fallback.
         if mode == "plagiarism":
-
-            heuristic_results = (
-                plagiarism_analyze(
-                    paragraphs
-                )
-            )
-
+            heuristic_results = plagiarism_analyze(paragraphs)
         else:
-
-            heuristic_results = analyze(
-                paragraphs,
-                use_openai=False,
-            )
+            heuristic_results = analyze(paragraphs, use_openai=False)
 
         constructed_results = []
+        external_items = external_data.get("items", []) if external_data else []
 
-        external_items = (
-
-            external_data.get(
-                "items",
-                []
-            )
-
-            if external_data
-
-            else []
-
-        )
-
-        for idx, paragraph in enumerate(
-            heuristic_results
-        ):
-
-            item_data = (
-
-                external_items[idx]
-
-                if idx < len(
-                    external_items
-                )
-
-                else {}
-
-            )
-
-            if mode == "plagiarism":
-
-                score = item_data.get(
-                    "plagiarism_score"
-                )
-
-            else:
-
-                score = item_data.get(
-                    "ai_score"
-                )
-
+        for idx, paragraph in enumerate(heuristic_results):
+            item_data = external_items[idx] if idx < len(external_items) else {}
+            score = item_data.get("plagiarism_score") if mode == "plagiarism" else item_data.get("ai_score")
             if score is None:
-
                 score = paragraph["score"]
 
             constructed_results.append({
-
-                "index":
-                    paragraph["index"],
-
-                "text":
-                    paragraph["text"],
-
-                "length":
-                    paragraph["length"],
-
-                "score":
-                    float(score),
-
-                "label": (
-
-                    item_data.get(
-                        "plagiarism_label"
-                    )
-
-                    or
-
-                    item_data.get(
-                        "ai_label"
-                    )
-
-                    or
-
-                    paragraph["label"]
-
-                ),
-
-                "reason": (
-
-                    item_data.get(
-                        "reason"
-                    )
-
-                    or
-
-                    paragraph["reason"]
-
-                ),
-
-                "plagiarism_score":
-                    item_data.get(
-                        "plagiarism_score"
-                    ),
-
-                "plagiarism_label":
-                    item_data.get(
-                        "plagiarism_label"
-                    ),
-
+                "index": paragraph["index"],
+                "text": paragraph["text"],
+                "length": paragraph["length"],
+                "score": float(score),
+                "label": item_data.get("plagiarism_label") or item_data.get("ai_label") or paragraph["label"],
+                "reason": item_data.get("reason") or paragraph["reason"],
+                "plagiarism_score": item_data.get("plagiarism_score") if mode == "plagiarism" else item_data.get("plagiarism_score"),
+                "plagiarism_label": item_data.get("plagiarism_label"),
             })
 
         if mode == "plagiarism":
-
-            local_summary = (
-                plagiarism_aggregate(
-                    heuristic_results
-                )
-            )
-
             summary = {
-
-                "overall_score": (
-
-                    external_data.get(
-                        "plagiarism_score"
-                    )
-
-                    if (
-                        external_data
-                        and
-                        external_data.get(
-                            "plagiarism_score"
-                        ) is not None
-                    )
-
-                    else
-
-                    local_summary[
-                        "overall_score"
-                    ]
-
-                ),
-
-                "plagiarism_score": (
-
-                    external_data.get(
-                        "plagiarism_score"
-                    )
-
-                    if (
-                        external_data
-                        and
-                        external_data.get(
-                            "plagiarism_score"
-                        ) is not None
-                    )
-
-                    else
-
-                    local_summary[
-                        "plagiarism_score"
-                    ]
-
-                ),
-
-                "plagiarism_label": (
-
-                    external_data.get(
-                        "plagiarism_label"
-                    )
-
-                    if external_data
-
-                    else
-
-                    local_summary[
-                        "plagiarism_label"
-                    ]
-
-                ),
-
-                "ai_label": (
-
-                    external_data.get(
-                        "ai_label"
-                    )
-
-                    if external_data
-
-                    else None
-
-                ),
-
+                "overall_score": external_data.get("plagiarism_score") if external_data and external_data.get("plagiarism_score") is not None else plagiarism_aggregate(heuristic_results)["overall_score"],
+                "plagiarism_score": external_data.get("plagiarism_score") if external_data else plagiarism_aggregate(heuristic_results)["plagiarism_score"],
+                "plagiarism_label": external_data.get("plagiarism_label") if external_data else plagiarism_aggregate(heuristic_results)["plagiarism_label"],
+                "ai_label": external_data.get("ai_label") if external_data else None,
             }
-
         else:
-
-            local_summary = aggregate(
-                heuristic_results
-            )
-
             summary = {
-
-                "overall_score": (
-
-                    external_data.get(
-                        "ai_score"
-                    )
-
-                    if (
-                        external_data
-                        and
-                        external_data.get(
-                            "ai_score"
-                        ) is not None
-                    )
-
-                    else
-
-                    local_summary[
-                        "overall_score"
-                    ]
-
-                ),
-
-                "plagiarism_score": (
-
-                    external_data.get(
-                        "plagiarism_score"
-                    )
-
-                    if external_data
-
-                    else None
-
-                ),
-
-                "ai_label": (
-
-                    external_data.get(
-                        "ai_label"
-                    )
-
-                    if external_data
-
-                    else None
-
-                ),
-
-                "plagiarism_label": (
-
-                    external_data.get(
-                        "plagiarism_label"
-                    )
-
-                    if external_data
-
-                    else None
-
-                ),
-
+                "overall_score": external_data.get("ai_score") if external_data and external_data.get("ai_score") is not None else aggregate(heuristic_results)["overall_score"],
+                "plagiarism_score": external_data.get("plagiarism_score") if external_data else None,
+                "ai_label": external_data.get("ai_label") if external_data else None,
+                "plagiarism_label": external_data.get("plagiarism_label") if external_data else None,
             }
 
         return JSONResponse(
-
             content={
-
-                "status":
-                    "success",
-
-                "username":
-                    user["username"],
-
-                "results":
-                    constructed_results,
-
-                "aggregate":
-                    summary,
-
-                "external_source":
-                    bool(external_data),
-
-                "external_error":
-                    external_error,
-
+                "results": constructed_results,
+                "aggregate": summary,
+                "external_source": bool(external_data),
+                "external_error": external_error,
             }
-
         )
-
     finally:
-
-        if temp_path:
-
-            try:
-
-                os.remove(
-                    temp_path
-                )
-
-            except OSError:
-
-                pass
+        cleanup_temp_file(temp_path)
 
 
-# ============================================================
-# DOWNLOAD PDF
-# ============================================================
+@app.post("/subscribe")
+def subscribe(payload: SubscribeRequest):
+    payment_method = payload.payment_method.lower()
+    if payment_method not in ALLOWED_PAYMENT_METHODS:
+        raise HTTPException(status_code=400, detail="Unsupported payment method. Use google_pay or phonepe.")
 
-@app.post("/download-report")
-def download_report(
+    if payment_method == "phonepe" and not payload.phone_number:
+        raise HTTPException(status_code=400, detail="PhonePe checkout requires a phone number.")
 
-    payload: Dict[str, Any],
-
-    authorization: Optional[str] =
-        Header(None),
-
-):
-
-    # PAYMENT GATE
-    get_active_user(
-        authorization
-    )
-
-    if not isinstance(
-        payload,
-        dict,
-    ):
-
+    plan = payload.plan.lower()
+    if plan not in PLAN_PRICES:
         raise HTTPException(
             status_code=400,
-            detail="Invalid request body.",
+            detail=f"Unknown plan '{payload.plan}'. Choose one of: {', '.join(PLAN_PRICES.keys())}.",
         )
 
-    try:
+    amount = PLAN_PRICES.get(plan, DEFAULT_PLAN_PRICE)
+    receipt = f"sub-{int(time.time())}"
+    checkout = create_razorpay_order(amount=amount, receipt=receipt)
 
-        print(
-            "Generating PDF..."
-        )
-
-        pdf_bytes = (
-            generate_report_pdf(
-                payload
-            )
-        )
-
-        if not isinstance(
-            pdf_bytes,
-            bytes,
-        ):
-
-            raise Exception(
-                "PDF generator did not "
-                "return bytes."
-            )
-
-        if not pdf_bytes:
-
-            raise Exception(
-                "PDF generator returned "
-                "empty bytes."
-            )
-
-        if not pdf_bytes.startswith(
-            b"%PDF"
-        ):
-
-            raise Exception(
-                "Generated output is "
-                "not a valid PDF."
-            )
-
-        print(
-            f"PDF SUCCESS - "
-            f"{len(pdf_bytes)} bytes"
-        )
-
-        return Response(
-
-            content=pdf_bytes,
-
-            media_type="application/pdf",
-
-            headers={
-
-                "Content-Disposition":
-                    (
-                        'attachment; '
-                        'filename='
-                        '"ai_plag_report.pdf"'
-                    ),
-
-                "Content-Length":
-                    str(
-                        len(pdf_bytes)
-                    ),
-
+    if checkout:
+        return {
+            "status": "success",
+            "provider": "razorpay",
+            "message": f"Subscription request received for {payload.plan} plan using {payment_method}. Complete checkout to activate your plan.",
+            "plan": payload.plan,
+            "payment_method": payment_method,
+            "phone_number": payload.phone_number,
+            "checkout": {
+                "key": os.getenv("RAZORPAY_KEY_ID"),
+                "order_id": checkout.get("id"),
+                "amount": checkout.get("amount"),
+                "currency": checkout.get("currency"),
+                "receipt": checkout.get("receipt"),
             },
+        }
 
-        )
+    return {
+        "status": "success",
+        "provider": "demo",
+        "message": f"Subscription request received for {payload.plan} plan using {payment_method}. Add Razorpay credentials to enable live payment checkout.",
+        "plan": payload.plan,
+        "payment_method": payment_method,
+        "phone_number": payload.phone_number,
+    }
 
-    except HTTPException:
-
-        raise
-
-    except Exception as exc:
-
-        print(
-            "PDF GENERATION ERROR:",
-            repr(exc),
-        )
-
-        raise HTTPException(
-
-            status_code=500,
-
-            detail=(
-                "PDF generation failed: "
-                f"{str(exc)}"
-            ),
-
-        )
-
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/")
 def health_check():
-
-    return {
-
-        "status":
-            "ok",
-
-        "message":
-            "AI Plag Analyzer backend is running.",
-
-    }
+    return {"status": "ok", "message": "AI Plag Analyzer backend is running."}
 
 
-@app.get("/health")
-def health():
+@app.post("/download-report", response_class=StreamingResponse)
+def download_report(payload: Dict[str, Any]):
 
-    return {
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid request body"
+        )
 
-        "status":
-            "healthy",
+    try:
+        print("Generating PDF...")
 
-        "users":
-            len(USERS),
+        # Generate PDF
+        pdf_bytes = generate_report_pdf(payload)
 
-        "payments":
-            len(PAYMENTS),
+        # Make absolutely sure we received bytes
+        if not isinstance(pdf_bytes, bytes):
+            raise Exception(
+                f"PDF generator returned {type(pdf_bytes).__name__}, not bytes"
+            )
 
-        "razorpay_configured":
-            bool(
-                RAZORPAY_KEY_ID
-                and
-                RAZORPAY_KEY_SECRET
-            ),
+        if len(pdf_bytes) == 0:
+            raise Exception("PDF generator returned empty bytes")
 
-    }
+        # Check PDF signature
+        if not pdf_bytes.startswith(b"%PDF"):
+            print("FIRST 100 BYTES:", repr(pdf_bytes[:100]))
+            raise Exception(
+                "Generated output is NOT a valid PDF. Missing %PDF header."
+            )
 
+        print(f"PDF SUCCESS - {len(pdf_bytes)} bytes")
 
-# ============================================================
-# RUN SERVER
-# ============================================================
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": 'attachment; filename="ai_plag_report.pdf"',
+                "Content-Length": str(len(pdf_bytes)),
+            }
+        )
 
-if __name__ == "__main__":
+    except Exception as exc:
 
+        print("====================================")
+        print("PDF GENERATION ERROR")
+        print(repr(exc))
+        print("====================================")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF generation failed: {str(exc)}"
+        )
+
+if __name__ == '__main__':
     import uvicorn
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "8000"
-        )
-    )
-
-    uvicorn.run(
-
-        "server:app",
-
-        host="0.0.0.0",
-
-        port=port,
-
-        reload=False,
-
-    )
-
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
