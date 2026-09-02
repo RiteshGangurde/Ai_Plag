@@ -531,7 +531,7 @@ def subscribe(payload: SubscribeRequest):
             detail=f"Unknown plan '{payload.plan}'. Choose one of: {', '.join(PLAN_PRICES.keys())}.",
         )
 
-    amount = PLAN_PRICES.get(plan, DEFAULT_PLAN_PRICE)
+    amount = PLAN_PRICES[plan]
     receipt = f"sub-{int(time.time())}"
     checkout = create_razorpay_order(amount=amount, receipt=receipt)
 
