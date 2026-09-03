@@ -57,17 +57,17 @@ PLAN_CONFIG: Dict[str, Dict[str, Any]] = {
     "basic": {
         "title": "Basic",
         "price": float(os.getenv("PLAN_PRICE_BASIC", "499")),
-        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_BASIC", "2999")),
+        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_BASIC", "1999")),
     },
     "premium": {
         "title": "Premium",
         "price": float(os.getenv("PLAN_PRICE_PREMIUM", "1499")),
-        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_PREMIUM", "7999")),
+        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_PREMIUM", "3999")),
     },
     "premium_pro": {
         "title": "Premium Pro",
         "price": float(os.getenv("PLAN_PRICE_PREMIUM_PRO", "1999")),
-        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_PREMIUM_PRO", "10000")),
+        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_PREMIUM_PRO", "7999")),
     },
 }
 
