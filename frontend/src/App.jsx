@@ -56,9 +56,9 @@ const getErrorDetail = (data) => {
 // very first render before that request resolves, so the page never shows
 // a blank plan picker - the numbers still match the backend's PLAN_CONFIG.
 const FALLBACK_PLAN_CATALOG = {
-  basic: { title: 'Basic', price: 499, word_limit: 2999 },
-  premium: { title: 'Premium', price: 1499, word_limit: 7999 },
-  premium_pro: { title: 'Premium Pro', price: 1999, word_limit: 10000 },
+  basic: { title: 'Basic', price: 499, word_limit: 1999 },
+  premium: { title: 'Premium', price: 1499, word_limit: 3999 },
+  premium_pro: { title: 'Premium Pro', price: 1999, word_limit: 7999 },
 }
 
 export default function App() {
