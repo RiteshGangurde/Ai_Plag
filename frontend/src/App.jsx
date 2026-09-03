@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar'
 
 const getApiBaseUrl = () => {
@@ -31,13 +31,48 @@ const parseJsonResponse = async (res) => {
   }
 }
 
+// The backend sometimes returns a structured `detail` object like
+// { error_code, message, word_count, limit, plan } (e.g. for word-limit
+// errors) and sometimes a plain string. This normalizes both shapes.
+const getErrorDetail = (data) => {
+  const detail = data && data.detail
+  if (detail && typeof detail === 'object') {
+    return {
+      errorCode: detail.error_code || null,
+      message: detail.message || 'Something went wrong.',
+      wordCount: detail.word_count,
+      limit: detail.limit,
+      plan: detail.plan,
+    }
+  }
+  return {
+    errorCode: null,
+    message: (typeof detail === 'string' && detail) || data?.message || 'Something went wrong.',
+  }
+}
+
+// Plans are also served by the backend at GET /plans, which is the source
+// of truth for word limits. This local copy is only a fallback used for the
+// very first render before that request resolves, so the page never shows
+// a blank plan picker - the numbers still match the backend's PLAN_CONFIG.
+const FALLBACK_PLAN_CATALOG = {
+  basic: { title: 'Basic', price: 499, word_limit: 2999 },
+  premium: { title: 'Premium', price: 1499, word_limit: 7999 },
+  premium_pro: { title: 'Premium Pro', price: 1999, word_limit: 10000 },
+}
+
 export default function App() {
+  const fileInputRef = useRef(null)
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [analysisMode, setAnalysisMode] = useState('ai')
   const [selectedPlan, setSelectedPlan] = useState('basic')
+  const [planCatalog, setPlanCatalog] = useState(FALLBACK_PLAN_CATALOG)
+  const [pendingPaymentEventId, setPendingPaymentEventId] = useState(null)
+  const [validatingFile, setValidatingFile] = useState(false)
+  const [limitExceeded, setLimitExceeded] = useState(null) // { wordCount, limit, plan }
   const [paymentMethod, setPaymentMethod] = useState('google_pay')
   const [phoneNumber, setPhoneNumber] = useState('')
   const [subscriptionStatus, setSubscriptionStatus] = useState(null)
@@ -70,7 +105,37 @@ export default function App() {
       : 'login'
   })
 
-  const handlePaymentSuccess = (message = 'Payment completed successfully. Your subscription is now active.') => {
+  // Marks the payment event as completed on the backend, which is what
+  // actually activates the user's plan server-side (see /payment-confirm).
+  // Without this, active_plan would never be set and every upload would be
+  // rejected for "no active plan".
+  const confirmPaymentAndActivatePlan = async (paymentEventId, paymentId) => {
+    try {
+      const res = await fetch(buildApiUrl('/payment-confirm'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          payment_event_id: paymentEventId,
+          payment_id: paymentId,
+          status: 'completed',
+        }),
+      })
+      const data = await parseJsonResponse(res)
+      if (!res.ok) throw new Error(getErrorDetail(data).message)
+      if (authToken) {
+        await loadUserProfile(authToken)
+      }
+      return true
+    } catch (err) {
+      setError(`Payment succeeded but activating your plan failed: ${err.message}. Please contact support.`)
+      return false
+    }
+  }
+
+  const handlePaymentSuccess = async (paymentId, message = 'Payment completed successfully. Your subscription is now active.') => {
+    if (pendingPaymentEventId) {
+      await confirmPaymentAndActivatePlan(pendingPaymentEventId, paymentId)
+    }
     setHasActiveSubscription(true)
     window.localStorage.setItem('subscriptionActive', 'true')
     setSubscriptionStatus({
@@ -79,6 +144,67 @@ export default function App() {
       provider: 'razorpay',
     })
     setActiveNav('upload')
+  }
+
+  // Re-validates a newly picked file against the signed-in user's actual
+  // active plan (fetched server-side from their token, never trusted from
+  // the client). The file only becomes the committed `file` state - and
+  // therefore only becomes eligible to submit - once this passes.
+  const validateSelectedFile = async (candidateFile) => {
+    if (!candidateFile) return
+    setError(null)
+    setLimitExceeded(null)
+    setValidatingFile(true)
+
+    try {
+      const fd = new FormData()
+      fd.append('file', candidateFile)
+
+      const res = await fetch(buildApiUrl('/validate-document'), {
+        method: 'POST',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        body: fd,
+      })
+      const data = await parseJsonResponse(res)
+
+      if (!res.ok) {
+        const detail = getErrorDetail(data)
+        if (detail.errorCode === 'NO_ACTIVE_PLAN') {
+          setError('You need an active plan to upload documents. Please choose a plan first.')
+        } else {
+          setError(detail.message)
+        }
+        return
+      }
+
+      if (data.valid) {
+        setFile(candidateFile)
+      } else {
+        setLimitExceeded({ wordCount: data.word_count, limit: data.limit, plan: data.plan })
+      }
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setValidatingFile(false)
+    }
+  }
+
+  const handleFileInputChange = (e) => {
+    const selected = e.target.files?.[0] ?? null
+    // Reset so selecting the same filename again (e.g. after "Change File")
+    // still fires this handler.
+    e.target.value = ''
+    if (!selected) return
+    validateSelectedFile(selected)
+  }
+
+  const handleChangeFile = () => {
+    setLimitExceeded(null)
+    fileInputRef.current?.click()
+  }
+
+  const handleCancelLimitModal = () => {
+    setLimitExceeded(null)
   }
 
   const handleSubmit = async (e) => {
@@ -95,13 +221,22 @@ export default function App() {
 
       const res = await fetch(buildApiUrl('/analyze'), {
         method: 'POST',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
         body: fd,
       })
-      if (!res.ok) {
-        const body = await res.text()
-        throw new Error(`Server error ${res.status}: ${body}`)
-      }
       const data = await parseJsonResponse(res)
+      if (!res.ok) {
+        const detail = getErrorDetail(data)
+        // Defense in depth: if the backend rejects a file that somehow got
+        // past the frontend pre-check (e.g. the plan changed in another
+        // tab), surface the exact same modal instead of a generic error.
+        if (detail.errorCode === 'WORD_LIMIT_EXCEEDED') {
+          setFile(null)
+          setLimitExceeded({ wordCount: detail.wordCount, limit: detail.limit, plan: detail.plan })
+          return
+        }
+        throw new Error(detail.message)
+      }
       setResult(data)
     } catch (err) {
       setError(err.message)
@@ -145,11 +280,18 @@ export default function App() {
     setError(null)
     setSubscriptionStatus(null)
 
+    if (!authToken) {
+      setError('Please sign in before subscribing to a plan.')
+      setSubscribing(false)
+      return
+    }
+
     try {
       const res = await fetch(buildApiUrl('/subscribe'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
         },
         body: JSON.stringify({
           plan: selectedPlan,
@@ -160,9 +302,10 @@ export default function App() {
 
       const data = await parseJsonResponse(res)
       if (!res.ok) {
-        throw new Error(data.detail || 'Subscription request failed')
+        throw new Error(getErrorDetail(data).message)
       }
 
+      setPendingPaymentEventId(data.payment_event_id || null)
       setSubscriptionStatus({
         message: data.message,
         method: data.payment_method,
@@ -178,8 +321,8 @@ export default function App() {
           name: 'AI Plag Detector',
           description: `Subscription: ${data.plan}`,
           order_id: data.checkout.order_id,
-          handler: function () {
-            handlePaymentSuccess()
+          handler: function (response) {
+            handlePaymentSuccess(response?.razorpay_payment_id || `pay_${Date.now()}`)
           },
           prefill: {
             contact: data.phone_number || '',
@@ -192,7 +335,7 @@ export default function App() {
         const razorpayInstance = new window.Razorpay(options)
         razorpayInstance.open()
       } else if (data.provider === 'demo') {
-        handlePaymentSuccess('Demo payment completed successfully. Your subscription is now active.')
+        handlePaymentSuccess(`pay_${Date.now()}`, 'Demo payment completed successfully. Your subscription is now active.')
       }
     } catch (err) {
       setError(err.message)
@@ -389,16 +532,35 @@ export default function App() {
         headers: { Authorization: `Bearer ${token}` },
       })
       const data = await parseJsonResponse(res)
-      if (!res.ok) throw new Error(data.detail || 'Unable to load profile')
+      if (!res.ok) throw new Error(getErrorDetail(data).message)
       setAuthUser(data.user || null)
       if (data.user?.username) {
         setAuthUsername('')
         setAuthPassword('')
       }
+      // The backend's active_plan is the real source of truth for whether
+      // this user can upload. Keep the local "has subscription" flag (used
+      // only for which nav tab opens by default) in sync with it.
+      if (data.user?.active_plan) {
+        setHasActiveSubscription(true)
+        window.localStorage.setItem('subscriptionActive', 'true')
+      }
     } catch (err) {
       setAuthError(err.message)
     }
   }
+
+  useEffect(() => {
+    fetch(buildApiUrl('/plans'))
+      .then(parseJsonResponse)
+      .then((data) => {
+        if (data?.plans) setPlanCatalog(data.plans)
+      })
+      .catch(() => {
+        // Non-fatal: the static FALLBACK_PLAN_CATALOG keeps the plan picker
+        // usable, and the backend re-validates the real limit regardless.
+      })
+  }, [])
 
   useEffect(() => {
     if (authToken) {
@@ -630,24 +792,20 @@ export default function App() {
                 </div>
 
                 <div className="plan-grid">
-                  {[
-                    { id: 'basic', title: 'Basic', description: 'Up to 2,999 words', price: '₹499', period: 'one-time' },
-                    { id: 'premium', title: 'Premium', description: 'Up to 7,999 words', price: '₹1,499', period: 'one-time' },
-                    { id: 'premium_pro', title: 'Premium Pro', description: 'Up to 10,000 words', price: '₹1,999', period: 'one-time' },
-                  ].map((plan) => (
+                  {Object.entries(planCatalog).map(([planId, plan]) => (
                     <button
-                      key={plan.id}
+                      key={planId}
                       type="button"
-                      className={`plan-card ${selectedPlan === plan.id ? 'plan-card--active' : ''}`}
-                      onClick={() => setSelectedPlan(plan.id)}
-                      aria-pressed={selectedPlan === plan.id}
+                      className={`plan-card ${selectedPlan === planId ? 'plan-card--active' : ''}`}
+                      onClick={() => setSelectedPlan(planId)}
+                      aria-pressed={selectedPlan === planId}
                     >
-                      {selectedPlan === plan.id && <span className="plan-card-check" aria-hidden="true">✓</span>}
+                      {selectedPlan === planId && <span className="plan-card-check" aria-hidden="true">✓</span>}
                       <span className="plan-card-title">{plan.title}</span>
-                      <span className="plan-card-desc">{plan.description}</span>
+                      <span className="plan-card-desc">Up to {plan.word_limit.toLocaleString()} words</span>
                       <span className="plan-card-price">
-                        {plan.price}
-                        <span className="plan-card-period"> / {plan.period}</span>
+                        ₹{plan.price.toLocaleString()}
+                        <span className="plan-card-period"> / one-time</span>
                       </span>
                     </button>
                   ))}
@@ -723,19 +881,31 @@ export default function App() {
                       </svg>
                     </div>
                     <h2>Upload a document</h2>
-                    <p className="upload-subtext">Choose an analysis mode, then select a .docx file to verify.</p>
+                    <p className="upload-subtext">
+                      Choose an analysis mode, then select a .docx or .pdf file to verify.
+                      {authUser?.active_plan && authUser?.word_limit && (
+                        <> Your {planCatalog[authUser.active_plan]?.title || authUser.active_plan} plan allows up to{' '}
+                        {authUser.word_limit.toLocaleString()} words per document.</>
+                      )}
+                    </p>
 
                     <form onSubmit={handleSubmit}>
                       <label htmlFor="file-input" className={`file-drop ${file ? 'file-drop--filled' : ''}`}>
                         <span className="file-drop-text">
-                          {file ? file.name : 'Click to select a .docx file, or drag and drop'}
+                          {validatingFile
+                            ? 'Checking document word count…'
+                            : file
+                              ? file.name
+                              : 'Click to select a .docx or .pdf file, or drag and drop'}
                         </span>
-                        {file && <span className="file-drop-badge">Selected</span>}
+                        {file && !validatingFile && <span className="file-drop-badge">Selected</span>}
                         <input
                           id="file-input"
+                          ref={fileInputRef}
                           type="file"
-                          accept=".docx"
-                          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+                          accept=".docx,.pdf"
+                          onChange={handleFileInputChange}
+                          disabled={validatingFile}
                           className="file-input-hidden"
                         />
                       </label>
@@ -763,7 +933,7 @@ export default function App() {
                         </label>
                       </div>
 
-                      <button type="submit" disabled={!file || loading} className="btn btn-primary btn-lg btn-block">
+                      <button type="submit" disabled={!file || loading || validatingFile} className="btn btn-primary btn-lg btn-block">
                         {loading ? (
                           <>
                             <span className="spinner" aria-hidden="true"></span>
@@ -989,6 +1159,52 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {limitExceeded && (
+        <div
+          className="modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="limit-modal-title"
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(15, 23, 42, 0.55)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+            padding: '16px',
+          }}
+        >
+          <div
+            className="modal-box"
+            style={{
+              background: '#fff',
+              borderRadius: '12px',
+              padding: '28px',
+              maxWidth: '420px',
+              width: '100%',
+              boxShadow: '0 20px 60px rgba(0, 0, 0, 0.25)',
+            }}
+          >
+            <h3 id="limit-modal-title" style={{ marginTop: 0 }}>File exceeds your plan limit</h3>
+            <p>
+              Your current plan allows <strong>{limitExceeded.limit?.toLocaleString()} words</strong>, but this
+              document contains <strong>{limitExceeded.wordCount?.toLocaleString()} words</strong>.
+            </p>
+            <p>Please upload a shorter document or upgrade your plan.</p>
+            <div style={{ display: 'flex', gap: '12px', marginTop: '20px' }}>
+              <button type="button" className="btn btn-primary" onClick={handleChangeFile}>
+                Change File
+              </button>
+              <button type="button" className="btn btn-secondary" onClick={handleCancelLimitModal}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <footer className="footer">
         <p>© 2026 SAHFON Verify · Protecting academic integrity</p>

@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 import json
+import re
 import time
 import requests
 from tempfile import NamedTemporaryFile
@@ -13,6 +14,11 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 import io
+
+try:
+    from pypdf import PdfReader
+except ImportError:  # pragma: no cover - surfaced as a friendly error at request time
+    PdfReader = None
 
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -36,13 +42,45 @@ app = FastAPI(
 
 ALLOWED_PAYMENT_METHODS = {"google_pay", "phonepe"}
 
-# Rupee amount charged per plan. Override any of these via env vars if needed,
-# e.g. PLAN_PRICE_PREMIUM_PRO=2499
-PLAN_PRICES: Dict[str, float] = {
-    "basic": float(os.getenv("PLAN_PRICE_BASIC", "499")),
-    "premium": float(os.getenv("PLAN_PRICE_PREMIUM", "1499")),
-    "premium_pro": float(os.getenv("PLAN_PRICE_PREMIUM_PRO", "1999")),
+# ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH for plan pricing + document word limits.
+#
+# These are the same three plans/prices that already existed in this file
+# (PLAN_PRICES) and the same word limits that were already shown, as plain
+# text only, on the plan cards in the frontend ("Up to 2,999 words", etc).
+# Nothing here is a new plan or a new price - the word limits are just now
+# enforced instead of being decorative copy.
+#
+# Override any value via env vars, e.g. PLAN_WORD_LIMIT_PREMIUM_PRO=12000
+# ---------------------------------------------------------------------------
+PLAN_CONFIG: Dict[str, Dict[str, Any]] = {
+    "basic": {
+        "title": "Basic",
+        "price": float(os.getenv("PLAN_PRICE_BASIC", "499")),
+        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_BASIC", "2999")),
+    },
+    "premium": {
+        "title": "Premium",
+        "price": float(os.getenv("PLAN_PRICE_PREMIUM", "1499")),
+        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_PREMIUM", "7999")),
+    },
+    "premium_pro": {
+        "title": "Premium Pro",
+        "price": float(os.getenv("PLAN_PRICE_PREMIUM_PRO", "1999")),
+        "word_limit": int(os.getenv("PLAN_WORD_LIMIT_PREMIUM_PRO", "10000")),
+    },
 }
+
+# Kept for backwards compatibility with the rest of this file, which already
+# used PLAN_PRICES[plan] in a couple of places.
+PLAN_PRICES: Dict[str, float] = {plan: cfg["price"] for plan, cfg in PLAN_CONFIG.items()}
+
+
+def get_plan_word_limit(plan: Optional[str]) -> Optional[int]:
+    if not plan:
+        return None
+    cfg = PLAN_CONFIG.get(plan.lower())
+    return cfg["word_limit"] if cfg else None
 
 
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
@@ -95,12 +133,53 @@ def find_user_by_token(token: str) -> Optional[Dict[str, Any]]:
 def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not user:
         return None
+    active_plan = user.get('active_plan')
     return {
         'username': user.get('username'),
         'email': user.get('email'),
         'token': user.get('token'),
         'created_at': user.get('created_at'),
+        'active_plan': active_plan,
+        'word_limit': get_plan_word_limit(active_plan),
     }
+
+
+def set_user_active_plan(username: str, plan: str) -> None:
+    """Persist the user's paid/active plan. This is the ONLY place that is
+    allowed to set active_plan, and it is only ever called with a plan value
+    that came from a server-created payment event - never from a value the
+    frontend sends directly."""
+    users = get_user_collection()
+    if users is not None:
+        users.update_one({'username': username}, {'$set': {'active_plan': plan}})
+        return
+    user = USERS.get(username)
+    if user is not None:
+        user['active_plan'] = plan
+
+
+def get_authenticated_user(authorization: Optional[str]) -> Dict[str, Any]:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+    token = authorization.replace("Bearer ", "", 1)
+    user = find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
+def require_active_plan(user: Dict[str, Any]) -> (str, int):
+    plan = user.get('active_plan')
+    limit = get_plan_word_limit(plan)
+    if not plan or limit is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error_code": "NO_ACTIVE_PLAN",
+                "message": "You don't have an active subscription plan yet. Please subscribe to a plan to upload documents.",
+            },
+        )
+    return plan, limit
 
 
 class SubscribeRequest(BaseModel):
@@ -155,10 +234,111 @@ def cleanup_temp_file(path: str) -> None:
         pass
 
 
-def create_payment_event(plan: str, payment_method: str, provider: str, order_id: str, phone_number: Optional[str] = None) -> Dict[str, Any]:
+SUPPORTED_EXTENSIONS = {".docx", ".pdf"}
+
+
+class DocumentProcessingError(Exception):
+    """Raised for any document-read/extraction problem. Carries a stable
+    error_code so the frontend can show a specific, user-friendly message."""
+
+    def __init__(self, error_code: str, message: str):
+        self.error_code = error_code
+        self.message = message
+        super().__init__(message)
+
+
+def count_words(text: Optional[str]) -> int:
+    """Accurate word count that is safe against multiple spaces, tabs,
+    newlines, and empty/None text."""
+    if not text:
+        return 0
+    return len(re.findall(r"\S+", text))
+
+
+def get_file_extension(filename: Optional[str]) -> str:
+    if not filename or "." not in filename:
+        return ""
+    return "." + filename.rsplit(".", 1)[-1].lower()
+
+
+def extract_paragraphs_from_docx(file_bytes: bytes) -> List[Dict[str, Any]]:
+    """Reuses the same docx paragraph loader the existing analysis pipeline
+    already relies on, so word counting and analysis always see identical
+    text."""
+    temp_path = write_temp_docx(file_bytes)
+    try:
+        paragraphs = load_paragraphs(temp_path)
+    except Exception as exc:
+        raise DocumentProcessingError(
+            "FILE_READ_ERROR",
+            "This .docx file could not be read. It may be corrupted or in an unsupported Word format.",
+        ) from exc
+    finally:
+        cleanup_temp_file(temp_path)
+
+    if not paragraphs:
+        raise DocumentProcessingError(
+            "NO_TEXT_FOUND",
+            "No readable text was found in this document.",
+        )
+    return paragraphs
+
+
+def extract_paragraphs_from_pdf(file_bytes: bytes) -> List[Dict[str, Any]]:
+    if PdfReader is None:
+        raise DocumentProcessingError(
+            "FILE_READ_ERROR",
+            "PDF support is not available on the server right now. Please try a .docx file, or contact support.",
+        )
+
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        page_texts = [page.extract_text() or "" for page in reader.pages]
+    except Exception as exc:
+        raise DocumentProcessingError(
+            "FILE_READ_ERROR",
+            "This PDF could not be read. It may be corrupted, password-protected, or a scanned image without extractable text.",
+        ) from exc
+
+    full_text = "\n\n".join(page_texts)
+    raw_blocks = [block.strip() for block in re.split(r"\n\s*\n", full_text) if block.strip()]
+    if not raw_blocks and full_text.strip():
+        raw_blocks = [full_text.strip()]
+
+    if not raw_blocks:
+        raise DocumentProcessingError(
+            "NO_TEXT_FOUND",
+            "No extractable text was found in this PDF. Scanned/image-only PDFs are not supported.",
+        )
+
+    return [
+        {"index": i + 1, "text": block, "length": len(block)}
+        for i, block in enumerate(raw_blocks)
+    ]
+
+
+def extract_paragraphs(file_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
+    extension = get_file_extension(filename)
+    if extension == ".docx":
+        return extract_paragraphs_from_docx(file_bytes)
+    if extension == ".pdf":
+        return extract_paragraphs_from_pdf(file_bytes)
+    raise DocumentProcessingError(
+        "UNSUPPORTED_FILE_TYPE",
+        "Unsupported file type. Please upload a .docx or .pdf file.",
+    )
+
+
+def word_count_from_paragraphs(paragraphs: List[Dict[str, Any]]) -> int:
+    document_text = "\n\n".join(p.get("text", "") for p in paragraphs)
+    return count_words(document_text)
+
+
+def create_payment_event(plan: str, payment_method: str, provider: str, order_id: str, username: Optional[str] = None, phone_number: Optional[str] = None) -> Dict[str, Any]:
     event = {
         "id": str(uuid.uuid4()),
         "plan": plan,
+        "username": username,
         "payment_method": payment_method,
         "provider": provider,
         "order_id": order_id,
@@ -372,10 +552,33 @@ def payment_confirm(payload: PaymentConfirmRequest):
     target["message"] = "Payment received and confirmed by the system."
     target["confirmed_at"] = int(time.time())
 
+    # This is the single place a user's active plan gets activated. The plan
+    # comes from the payment event that /subscribe created server-side for
+    # that user - never from anything the client sends in this request.
+    if target["status"] == "completed" and target.get("username"):
+        set_user_active_plan(target["username"], target["plan"])
+
     return {
         "status": "success",
         "message": "Payment confirmed and admin notified.",
         "payment_event": target,
+    }
+
+
+@app.get("/plans")
+def list_plans():
+    """Public plan catalogue (price + word limit) so the frontend never has
+    to hardcode these numbers separately from the backend."""
+    return {
+        "status": "success",
+        "plans": {
+            plan_id: {
+                "title": cfg["title"],
+                "price": cfg["price"],
+                "word_limit": cfg["word_limit"],
+            }
+            for plan_id, cfg in PLAN_CONFIG.items()
+        },
     }
 
 
@@ -429,7 +632,39 @@ def normalize_external_response(response: Dict[str, Any]) -> Dict[str, Any]:
 def analyze_info():
     return {
         "status": "ok",
-        "message": "Use POST /analyze with a multipart/form-data file upload to analyze a .docx document.",
+        "message": "Use POST /analyze with a multipart/form-data file upload (.docx or .pdf) to analyze a document.",
+    }
+
+
+@app.post("/validate-document")
+async def validate_document(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Lightweight pre-check used by the frontend right after a file is
+    selected: extracts the text, counts words, and compares against the
+    signed-in user's actual active plan. Does NOT run plagiarism/AI
+    detection. This is a UX convenience only - /analyze re-checks the same
+    limit itself, since that is the endpoint that actually matters."""
+    user = get_authenticated_user(authorization)
+    plan, limit = require_active_plan(user)
+
+    file_bytes = await file.read()
+
+    try:
+        paragraphs = extract_paragraphs(file_bytes, file.filename or "")
+    except DocumentProcessingError as exc:
+        raise HTTPException(status_code=400, detail={"error_code": exc.error_code, "message": exc.message})
+
+    word_count = word_count_from_paragraphs(paragraphs)
+    within_limit = word_count <= limit
+
+    return {
+        "status": "success",
+        "valid": within_limit,
+        "word_count": word_count,
+        "limit": limit,
+        "plan": plan,
     }
 
 
@@ -437,86 +672,106 @@ def analyze_info():
 async def analyze_document(
     file: UploadFile = File(...),
     mode: str = Form('ai'),
+    authorization: Optional[str] = Header(None),
 ):
-    if not file.filename.lower().endswith(".docx"):
-        raise HTTPException(status_code=400, detail="Only .docx files are supported")
+    # Real enforcement happens here, server-side, using the caller's actual
+    # paid plan - never a plan value the frontend could send.
+    user = get_authenticated_user(authorization)
+    plan, limit = require_active_plan(user)
 
     if mode not in {"ai", "plagiarism"}:
         raise HTTPException(status_code=400, detail="Invalid analysis mode. Use ai or plagiarism.")
 
     file_bytes = await file.read()
-    temp_path = write_temp_docx(file_bytes)
 
     try:
-        paragraphs = load_paragraphs(temp_path)
-        if not paragraphs:
-            raise HTTPException(status_code=400, detail="The uploaded document contains no readable paragraphs.")
+        paragraphs = extract_paragraphs(file_bytes, file.filename or "")
+    except DocumentProcessingError as exc:
+        raise HTTPException(status_code=400, detail={"error_code": exc.error_code, "message": exc.message})
 
-        document_text = "\n\n".join(p["text"] for p in paragraphs)
-        external_data = None
-        external_error = None
-
-        try:
-            raw_response = send_text_to_external_api(document_text)
-            if raw_response:
-                external_data = normalize_external_response(raw_response)
-        except Exception as exc:
-            external_error = str(exc)
-
-        if mode == "plagiarism":
-            heuristic_results = plagiarism_analyze(paragraphs)
-        else:
-            heuristic_results = analyze(paragraphs, use_openai=False)
-
-        constructed_results = []
-        external_items = external_data.get("items", []) if external_data else []
-
-        for idx, paragraph in enumerate(heuristic_results):
-            item_data = external_items[idx] if idx < len(external_items) else {}
-            score = item_data.get("plagiarism_score") if mode == "plagiarism" else item_data.get("ai_score")
-            if score is None:
-                score = paragraph["score"]
-
-            constructed_results.append({
-                "index": paragraph["index"],
-                "text": paragraph["text"],
-                "length": paragraph["length"],
-                "score": float(score),
-                "label": item_data.get("plagiarism_label") or item_data.get("ai_label") or paragraph["label"],
-                "reason": item_data.get("reason") or paragraph["reason"],
-                "plagiarism_score": item_data.get("plagiarism_score") if mode == "plagiarism" else item_data.get("plagiarism_score"),
-                "plagiarism_label": item_data.get("plagiarism_label"),
-            })
-
-        if mode == "plagiarism":
-            summary = {
-                "overall_score": external_data.get("plagiarism_score") if external_data and external_data.get("plagiarism_score") is not None else plagiarism_aggregate(heuristic_results)["overall_score"],
-                "plagiarism_score": external_data.get("plagiarism_score") if external_data else plagiarism_aggregate(heuristic_results)["plagiarism_score"],
-                "plagiarism_label": external_data.get("plagiarism_label") if external_data else plagiarism_aggregate(heuristic_results)["plagiarism_label"],
-                "ai_label": external_data.get("ai_label") if external_data else None,
-            }
-        else:
-            summary = {
-                "overall_score": external_data.get("ai_score") if external_data and external_data.get("ai_score") is not None else aggregate(heuristic_results)["overall_score"],
-                "plagiarism_score": external_data.get("plagiarism_score") if external_data else None,
-                "ai_label": external_data.get("ai_label") if external_data else None,
-                "plagiarism_label": external_data.get("plagiarism_label") if external_data else None,
-            }
-
-        return JSONResponse(
-            content={
-                "results": constructed_results,
-                "aggregate": summary,
-                "external_source": bool(external_data),
-                "external_error": external_error,
-            }
+    word_count = word_count_from_paragraphs(paragraphs)
+    if word_count > limit:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_code": "WORD_LIMIT_EXCEEDED",
+                "message": f"Your current plan allows {limit:,} words, but this document contains {word_count:,} words.",
+                "word_count": word_count,
+                "limit": limit,
+                "plan": plan,
+            },
         )
-    finally:
-        cleanup_temp_file(temp_path)
+
+    document_text = "\n\n".join(p["text"] for p in paragraphs)
+    external_data = None
+    external_error = None
+
+    try:
+        raw_response = send_text_to_external_api(document_text)
+        if raw_response:
+            external_data = normalize_external_response(raw_response)
+    except Exception as exc:
+        external_error = str(exc)
+
+    if mode == "plagiarism":
+        heuristic_results = plagiarism_analyze(paragraphs)
+    else:
+        heuristic_results = analyze(paragraphs, use_openai=False)
+
+    constructed_results = []
+    external_items = external_data.get("items", []) if external_data else []
+
+    for idx, paragraph in enumerate(heuristic_results):
+        item_data = external_items[idx] if idx < len(external_items) else {}
+        score = item_data.get("plagiarism_score") if mode == "plagiarism" else item_data.get("ai_score")
+        if score is None:
+            score = paragraph["score"]
+
+        constructed_results.append({
+            "index": paragraph["index"],
+            "text": paragraph["text"],
+            "length": paragraph["length"],
+            "score": float(score),
+            "label": item_data.get("plagiarism_label") or item_data.get("ai_label") or paragraph["label"],
+            "reason": item_data.get("reason") or paragraph["reason"],
+            "plagiarism_score": item_data.get("plagiarism_score") if mode == "plagiarism" else item_data.get("plagiarism_score"),
+            "plagiarism_label": item_data.get("plagiarism_label"),
+        })
+
+    if mode == "plagiarism":
+        summary = {
+            "overall_score": external_data.get("plagiarism_score") if external_data and external_data.get("plagiarism_score") is not None else plagiarism_aggregate(heuristic_results)["overall_score"],
+            "plagiarism_score": external_data.get("plagiarism_score") if external_data else plagiarism_aggregate(heuristic_results)["plagiarism_score"],
+            "plagiarism_label": external_data.get("plagiarism_label") if external_data else plagiarism_aggregate(heuristic_results)["plagiarism_label"],
+            "ai_label": external_data.get("ai_label") if external_data else None,
+        }
+    else:
+        summary = {
+            "overall_score": external_data.get("ai_score") if external_data and external_data.get("ai_score") is not None else aggregate(heuristic_results)["overall_score"],
+            "plagiarism_score": external_data.get("plagiarism_score") if external_data else None,
+            "ai_label": external_data.get("ai_label") if external_data else None,
+            "plagiarism_label": external_data.get("plagiarism_label") if external_data else None,
+        }
+
+    return JSONResponse(
+        content={
+            "results": constructed_results,
+            "aggregate": summary,
+            "external_source": bool(external_data),
+            "external_error": external_error,
+            "word_count": word_count,
+            "word_limit": limit,
+        }
+    )
 
 
 @app.post("/subscribe")
-def subscribe(payload: SubscribeRequest):
+def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(None)):
+    # The subscribing user must be identified from their own auth token so
+    # that the plan we later activate is tied to a real account, not to
+    # whatever the frontend happens to send.
+    user = get_authenticated_user(authorization)
+
     payment_method = payload.payment_method.lower()
     if payment_method not in ALLOWED_PAYMENT_METHODS:
         raise HTTPException(status_code=400, detail="Unsupported payment method. Use google_pay or phonepe.")
@@ -536,13 +791,23 @@ def subscribe(payload: SubscribeRequest):
     checkout = create_razorpay_order(amount=amount, receipt=receipt)
 
     if checkout:
+        event = create_payment_event(
+            plan=plan,
+            payment_method=payment_method,
+            provider="razorpay",
+            order_id=checkout.get("id"),
+            username=user.get("username"),
+            phone_number=payload.phone_number,
+        )
         return {
             "status": "success",
             "provider": "razorpay",
             "message": f"Subscription request received for {payload.plan} plan using {payment_method}. Complete checkout to activate your plan.",
             "plan": payload.plan,
+            "word_limit": get_plan_word_limit(plan),
             "payment_method": payment_method,
             "phone_number": payload.phone_number,
+            "payment_event_id": event["id"],
             "checkout": {
                 "key": os.getenv("RAZORPAY_KEY_ID"),
                 "order_id": checkout.get("id"),
@@ -552,13 +817,23 @@ def subscribe(payload: SubscribeRequest):
             },
         }
 
+    event = create_payment_event(
+        plan=plan,
+        payment_method=payment_method,
+        provider="demo",
+        order_id=receipt,
+        username=user.get("username"),
+        phone_number=payload.phone_number,
+    )
     return {
         "status": "success",
         "provider": "demo",
         "message": f"Subscription request received for {payload.plan} plan using {payment_method}. Add Razorpay credentials to enable live payment checkout.",
         "plan": payload.plan,
+        "word_limit": get_plan_word_limit(plan),
         "payment_method": payment_method,
         "phone_number": payload.phone_number,
+        "payment_event_id": event["id"],
     }
 
 
