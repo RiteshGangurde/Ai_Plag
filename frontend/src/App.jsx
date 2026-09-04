@@ -95,18 +95,11 @@ export default function App() {
 
       const res = await fetch(buildApiUrl('/analyze'), {
         method: 'POST',
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
         body: fd,
       })
       if (!res.ok) {
-        let message = `Server error ${res.status}`
-        try {
-          const errBody = await res.json()
-          if (errBody?.detail) message = errBody.detail
-        } catch {
-          // response wasn't JSON; fall back to the generic message above
-        }
-        throw new Error(message)
+        const body = await res.text()
+        throw new Error(`Server error ${res.status}: ${body}`)
       }
       const data = await parseJsonResponse(res)
       setResult(data)
@@ -157,7 +150,6 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         },
         body: JSON.stringify({
           plan: selectedPlan,
@@ -186,26 +178,8 @@ export default function App() {
           name: 'AI Plag Detector',
           description: `Subscription: ${data.plan}`,
           order_id: data.checkout.order_id,
-          handler: async function (response) {
-            // Confirm the payment so the backend saves this plan + word limit on the user.
-            try {
-              const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  payment_event_id: data.payment_event_id,
-                  payment_id: response.razorpay_payment_id,
-                  status: 'completed',
-                }),
-              })
-              if (!confirmRes.ok) {
-                throw new Error(`Payment confirm returned ${confirmRes.status}`)
-              }
-              handlePaymentSuccess()
-            } catch (confirmErr) {
-              console.error('Payment confirm failed', confirmErr)
-              setError('Payment succeeded but we could not confirm your plan with the server. Please contact support before uploading a document.')
-            }
+          handler: function () {
+            handlePaymentSuccess()
           },
           prefill: {
             contact: data.phone_number || '',
@@ -218,24 +192,7 @@ export default function App() {
         const razorpayInstance = new window.Razorpay(options)
         razorpayInstance.open()
       } else if (data.provider === 'demo') {
-        try {
-          const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              payment_event_id: data.payment_event_id,
-              payment_id: `demo-${Date.now()}`,
-              status: 'completed',
-            }),
-          })
-          if (!confirmRes.ok) {
-            throw new Error(`Payment confirm returned ${confirmRes.status}`)
-          }
-          handlePaymentSuccess('Demo payment completed successfully. Your subscription is now active.')
-        } catch (confirmErr) {
-          console.error('Payment confirm failed', confirmErr)
-          setError('Payment succeeded but we could not confirm your plan with the server. Please try subscribing again.')
-        }
+        handlePaymentSuccess('Demo payment completed successfully. Your subscription is now active.')
       }
     } catch (err) {
       setError(err.message)
@@ -938,92 +895,95 @@ export default function App() {
                 )}
 
                 {/* Info Box */}
-                <div className="info-box">
-                  <h4>⚠️ Important Notice — One-Time Login & Analysis Access</h4>
+               
+<div className="info-box">
+  <h4>⚠️ Important Notice — One-Time Login & Analysis Access</h4>
 
-                  <p>
-                    Please read the following notice carefully before proceeding with your
-                    payment and analysis.
-                  </p>
+  <p>
+    Please read the following notice carefully before proceeding with your
+    payment and analysis.
+  </p>
 
-                  <p>
-                    This is a <strong>one-time login and payment session</strong>. Your access
-                    is linked to your current analysis session. This system is designed this
-                    way to help protect the privacy and security of your uploaded documents
-                    and analysis data.
-                  </p>
+  <p>
+    This is a <strong>one-time login and payment session</strong>. Your access
+    is linked to your current analysis session. This system is designed this
+    way to help protect the privacy and security of your uploaded documents
+    and analysis data.
+  </p>
 
-                  <p>
-                    <strong>⚠️ Do not reload, refresh, close, or navigate away from this page
-                    while your analysis is in progress.</strong>
-                  </p>
+  <p>
+    <strong>⚠️ Do not reload, refresh, close, or navigate away from this page
+    while your analysis is in progress.</strong>
+  </p>
 
-                  <p>
-                    Reloading or leaving the page may permanently clear your current session,
-                    uploaded documents, analysis results, and other associated data. For
-                    privacy and security reasons, lost session data may not be recoverable.
-                  </p>
+  <p>
+    Reloading or leaving the page may permanently clear your current session,
+    uploaded documents, analysis results, and other associated data. For
+    privacy and security reasons, lost session data may not be recoverable.
+  </p>
 
-                  <p>
-                    <strong>By proceeding, you acknowledge and agree to the following:</strong>
-                  </p>
+  <p>
+    <strong>By proceeding, you acknowledge and agree to the following:</strong>
+  </p>
 
-                  <ul>
-                    <li>
-                      Your payment provides access to the <strong>current analysis session only</strong>.
-                    </li>
+  <ul>
+    <li>
+      Your payment provides access to the <strong>current analysis session only</strong>.
+    </li>
 
-                    <li>
-                      If you <strong>reload or refresh the page</strong>, your current session,
-                      uploaded document, and analysis results may be lost.
-                    </li>
+    <li>
+      If you <strong>reload or refresh the page</strong>, your current session,
+      uploaded document, and analysis results may be lost.
+    </li>
 
-                    <li>
-                      If your session is lost because you reload or leave the page, you may
-                      be required to <strong>make the payment again</strong> to start a new
-                      analysis session.
-                    </li>
+    <li>
+      If your session is lost because you reload or leave the page, you may
+      be required to <strong>make the payment again</strong> to start a new
+      analysis session.
+    </li>
 
-                    <li>
-                      Please download your analysis report and save any required results
-                      <strong> before refreshing, closing, or leaving the page</strong>.
-                    </li>
+    <li>
+      Please download your analysis report and save any required results
+      <strong> before refreshing, closing, or leaving the page</strong>.
+    </li>
 
-                    <li>
-                      Do not use the browser's refresh button, close the tab, or navigate
-                      away from the analysis page until your analysis is complete and your
-                      results have been saved.
-                    </li>
+    <li>
+      Do not use the browser's refresh button, close the tab, or navigate
+      away from the analysis page until your analysis is complete and your
+      results have been saved.
+    </li>
 
-                    <li>
-                      This session-based approach is implemented as a
-                      <strong> data-privacy and security measure</strong> to minimize the
-                      retention and exposure of uploaded documents and analysis data.
-                    </li>
-                  </ul>
+    <li>
+      This session-based approach is implemented as a
+      <strong> data-privacy and security measure</strong> to minimize the
+      retention and exposure of uploaded documents and analysis data.
+    </li>
+  </ul>
 
-                  <p>
-                    <strong>By continuing with the payment and analysis, you confirm that you
-                    have read, understood, and agreed to these terms.</strong>
-                  </p>
+  <p>
+    <strong>By continuing with the payment and analysis, you confirm that you
+    have read, understood, and agreed to these terms.</strong>
+  </p>
 
-                  <p className="info-box-note">
-                    <strong>Important:</strong> We strongly recommend downloading your
-                    analysis report immediately after your analysis is completed.
-                  </p>
+  <p className="info-box-note">
+    <strong>Important:</strong> We strongly recommend downloading your
+    analysis report immediately after your analysis is completed.
+  </p>
 
-                  {externalError && (
-                    <p className="form-error">
-                      External API error: {externalError}
-                    </p>
-                  )}
+  {externalError && (
+    <p className="form-error">
+      External API error: {externalError}
+    </p>
+  )}
 
-                  {!externalError && externalSource && (
-                    <p className="info-box-note">
-                      Plagiarism and AI detection data were returned from the external API.
-                    </p>
-                  )}
-                </div>
+  {!externalError && externalSource && (
+    <p className="info-box-note">
+      Plagiarism and AI detection data were returned from the external API.
+    </p>
+  )}
+</div>
+
+
               </>
             )}
           </div>
