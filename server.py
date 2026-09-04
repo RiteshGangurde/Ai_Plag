@@ -365,8 +365,10 @@ def admin_payments(authorization: Optional[str] = Header(None)):
 
 @app.post("/payment-confirm")
 def payment_confirm(payload: PaymentConfirmRequest):
+    print(f"[payment-confirm] looking for event id={payload.payment_event_id!r} among {len(PAYMENT_EVENTS)} known events: {[e['id'] for e in PAYMENT_EVENTS]}")
     target = next((item for item in PAYMENT_EVENTS if item["id"] == payload.payment_event_id), None)
     if not target:
+        print(f"[payment-confirm] NOT FOUND - event id={payload.payment_event_id!r}")
         raise HTTPException(status_code=404, detail="Payment event not found")
 
     target["status"] = payload.status
@@ -381,6 +383,9 @@ def payment_confirm(payload: PaymentConfirmRequest):
             target.get("word_limit"),
             target.get("size_limit_mb"),
         )
+        print(f"[payment-confirm] set_user_plan called token={target['token']!r} plan={target.get('plan')} word_limit={target.get('word_limit')}")
+    else:
+        print(f"[payment-confirm] skipped set_user_plan - status={payload.status!r} token={target.get('token')!r}")
 
     return {
         "status": "success",
@@ -616,6 +621,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
             word_limit=word_limit,
             size_limit_mb=plan_size_limit_mb,
         )
+        print(f"[subscribe] created razorpay event id={event['id']} plan={payload.plan} token={token!r} total_events={len(PAYMENT_EVENTS)}")
         return {
             "status": "success",
             "provider": "razorpay",
@@ -643,6 +649,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
         word_limit=word_limit,
         size_limit_mb=plan_size_limit_mb,
     )
+    print(f"[subscribe] created demo event id={event['id']} plan={payload.plan} token={token!r} total_events={len(PAYMENT_EVENTS)}")
     return {
         "status": "success",
         "provider": "demo",
