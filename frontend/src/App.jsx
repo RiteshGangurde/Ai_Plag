@@ -95,11 +95,18 @@ export default function App() {
 
       const res = await fetch(buildApiUrl('/analyze'), {
         method: 'POST',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
         body: fd,
       })
       if (!res.ok) {
-        const body = await res.text()
-        throw new Error(`Server error ${res.status}: ${body}`)
+        let message = `Server error ${res.status}`
+        try {
+          const errBody = await res.json()
+          if (errBody?.detail) message = errBody.detail
+        } catch {
+          // response wasn't JSON; fall back to the generic message above
+        }
+        throw new Error(message)
       }
       const data = await parseJsonResponse(res)
       setResult(data)
@@ -150,6 +157,7 @@ export default function App() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         },
         body: JSON.stringify({
           plan: selectedPlan,
@@ -178,7 +186,21 @@ export default function App() {
           name: 'AI Plag Detector',
           description: `Subscription: ${data.plan}`,
           order_id: data.checkout.order_id,
-          handler: function () {
+          handler: async function (response) {
+            // Confirm the payment so the backend saves this plan + word limit on the user.
+            try {
+              await fetch(buildApiUrl('/payment-confirm'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  payment_event_id: data.payment_event_id,
+                  payment_id: response.razorpay_payment_id,
+                  status: 'completed',
+                }),
+              })
+            } catch (confirmErr) {
+              console.error('Payment confirm failed', confirmErr)
+            }
             handlePaymentSuccess()
           },
           prefill: {
@@ -192,6 +214,19 @@ export default function App() {
         const razorpayInstance = new window.Razorpay(options)
         razorpayInstance.open()
       } else if (data.provider === 'demo') {
+        try {
+          await fetch(buildApiUrl('/payment-confirm'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              payment_event_id: data.payment_event_id,
+              payment_id: `demo-${Date.now()}`,
+              status: 'completed',
+            }),
+          })
+        } catch (confirmErr) {
+          console.error('Payment confirm failed', confirmErr)
+        }
         handlePaymentSuccess('Demo payment completed successfully. Your subscription is now active.')
       }
     } catch (err) {
