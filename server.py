@@ -44,6 +44,14 @@ PLAN_PRICES: Dict[str, float] = {
     "premium_pro": float(os.getenv("PLAN_PRICE_PREMIUM_PRO", "1999")),
 }
 
+# Max words a user on each plan is allowed to upload per document.
+# Keep in sync with the plan descriptions shown in frontend/src/App.jsx.
+PLAN_WORD_LIMITS: Dict[str, int] = {
+    "basic": int(os.getenv("PLAN_WORDS_BASIC", "2999")),
+    "premium": int(os.getenv("PLAN_WORDS_PREMIUM", "7999")),
+    "premium_pro": int(os.getenv("PLAN_WORDS_PREMIUM_PRO", "10000")),
+}
+
 
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
@@ -92,6 +100,20 @@ def find_user_by_token(token: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def set_user_plan(token: str, plan: str, word_limit: int) -> None:
+    """Persist the purchased plan + word allowance on the user's account."""
+    if not token:
+        return
+    users = get_user_collection()
+    if users is not None:
+        users.update_one({'token': token}, {'$set': {'plan': plan, 'word_limit': word_limit}})
+        return
+    user = find_user_by_token(token)
+    if user:
+        user['plan'] = plan
+        user['word_limit'] = word_limit
+
+
 def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not user:
         return None
@@ -100,6 +122,8 @@ def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         'email': user.get('email'),
         'token': user.get('token'),
         'created_at': user.get('created_at'),
+        'plan': user.get('plan'),
+        'word_limit': user.get('word_limit'),
     }
 
 
@@ -155,7 +179,15 @@ def cleanup_temp_file(path: str) -> None:
         pass
 
 
-def create_payment_event(plan: str, payment_method: str, provider: str, order_id: str, phone_number: Optional[str] = None) -> Dict[str, Any]:
+def create_payment_event(
+    plan: str,
+    payment_method: str,
+    provider: str,
+    order_id: str,
+    phone_number: Optional[str] = None,
+    token: Optional[str] = None,
+    word_limit: Optional[int] = None,
+) -> Dict[str, Any]:
     event = {
         "id": str(uuid.uuid4()),
         "plan": plan,
@@ -166,6 +198,8 @@ def create_payment_event(plan: str, payment_method: str, provider: str, order_id
         "status": "pending",
         "message": "Payment requested by user.",
         "created_at": int(time.time()),
+        "token": token,
+        "word_limit": word_limit,
     }
     PAYMENT_EVENTS.append(event)
     return event
@@ -372,6 +406,9 @@ def payment_confirm(payload: PaymentConfirmRequest):
     target["message"] = "Payment received and confirmed by the system."
     target["confirmed_at"] = int(time.time())
 
+    if payload.status == "completed" and target.get("token"):
+        set_user_plan(target["token"], target.get("plan"), target.get("word_limit"))
+
     return {
         "status": "success",
         "message": "Payment confirmed and admin notified.",
@@ -437,12 +474,26 @@ def analyze_info():
 async def analyze_document(
     file: UploadFile = File(...),
     mode: str = Form('ai'),
+    authorization: Optional[str] = Header(None),
 ):
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Only .docx files are supported")
 
     if mode not in {"ai", "plagiarism"}:
         raise HTTPException(status_code=400, detail="Invalid analysis mode. Use ai or plagiarism.")
+
+    # Require a logged-in, subscribed user and enforce their plan's word limit.
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Login and subscribe to a plan before analyzing documents.")
+
+    token = authorization.replace("Bearer ", "", 1)
+    user = find_user_by_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
+
+    word_limit = user.get("word_limit")
+    if not user.get("plan") or not word_limit:
+        raise HTTPException(status_code=402, detail="No active subscription found. Please subscribe to a plan first.")
 
     file_bytes = await file.read()
     temp_path = write_temp_docx(file_bytes)
@@ -453,6 +504,17 @@ async def analyze_document(
             raise HTTPException(status_code=400, detail="The uploaded document contains no readable paragraphs.")
 
         document_text = "\n\n".join(p["text"] for p in paragraphs)
+
+        word_count = len(document_text.split())
+        if word_count > word_limit:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Your '{user['plan']}' plan allows up to {word_limit} words, "
+                    f"but this document has {word_count} words. Upgrade your plan to analyze it."
+                ),
+            )
+
         external_data = None
         external_error = None
 
@@ -516,7 +578,7 @@ async def analyze_document(
 
 
 @app.post("/subscribe")
-def subscribe(payload: SubscribeRequest):
+def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(None)):
     payment_method = payload.payment_method.lower()
     if payment_method not in ALLOWED_PAYMENT_METHODS:
         raise HTTPException(status_code=400, detail="Unsupported payment method. Use google_pay or phonepe.")
@@ -532,10 +594,21 @@ def subscribe(payload: SubscribeRequest):
         )
 
     amount = PLAN_PRICES[plan]
+    word_limit = PLAN_WORD_LIMITS[plan]
     receipt = f"sub-{int(time.time())}"
     checkout = create_razorpay_order(amount=amount, receipt=receipt)
+    token = authorization.replace("Bearer ", "", 1) if authorization else None
 
     if checkout:
+        event = create_payment_event(
+            plan=payload.plan,
+            payment_method=payment_method,
+            provider="razorpay",
+            order_id=checkout.get("id"),
+            phone_number=payload.phone_number,
+            token=token,
+            word_limit=word_limit,
+        )
         return {
             "status": "success",
             "provider": "razorpay",
@@ -543,6 +616,7 @@ def subscribe(payload: SubscribeRequest):
             "plan": payload.plan,
             "payment_method": payment_method,
             "phone_number": payload.phone_number,
+            "payment_event_id": event["id"],
             "checkout": {
                 "key": os.getenv("RAZORPAY_KEY_ID"),
                 "order_id": checkout.get("id"),
@@ -552,6 +626,15 @@ def subscribe(payload: SubscribeRequest):
             },
         }
 
+    event = create_payment_event(
+        plan=payload.plan,
+        payment_method=payment_method,
+        provider="demo",
+        order_id=receipt,
+        phone_number=payload.phone_number,
+        token=token,
+        word_limit=word_limit,
+    )
     return {
         "status": "success",
         "provider": "demo",
@@ -559,6 +642,7 @@ def subscribe(payload: SubscribeRequest):
         "plan": payload.plan,
         "payment_method": payment_method,
         "phone_number": payload.phone_number,
+        "payment_event_id": event["id"],
     }
 
 
