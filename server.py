@@ -15,6 +15,8 @@ from fastapi.responses import JSONResponse, StreamingResponse, Response
 import io
 
 from pydantic import BaseModel
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
 
 from analyze_docx import (
@@ -50,21 +52,6 @@ PLAN_WORD_LIMITS: Dict[str, int] = {
     "premium_pro": int(os.getenv("PLAN_WORDS_PREMIUM_PRO", "10000")),
 }
 
-# Max uploaded file SIZE (in MB) per plan, checked on the raw bytes before the
-# document is even parsed. This exists separately from the word limit because
-# a file can be "big" (lots of MB) without having many extractable words -
-# e.g. a scanned document, embedded images, or heavy formatting/objects.
-PLAN_SIZE_LIMITS_MB: Dict[str, float] = {
-    "basic": float(os.getenv("PLAN_SIZE_MB_BASIC", "2")),
-    "premium": float(os.getenv("PLAN_SIZE_MB_PREMIUM", "5")),
-    "premium_pro": float(os.getenv("PLAN_SIZE_MB_PREMIUM_PRO", "8")),
-}
-
-
-def size_limit_bytes(plan: str) -> Optional[int]:
-    mb = PLAN_SIZE_LIMITS_MB.get(plan)
-    return int(mb * 1024 * 1024) if mb is not None else None
-
 
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
@@ -72,29 +59,59 @@ ADMIN_SESSION_TOKENS: Dict[str, Dict[str, Any]] = {}
 PAYMENT_EVENTS: List[Dict[str, Any]] = []
 USERS: Dict[str, Dict[str, Any]] = {}
 
+DEFAULT_MONGODB_URI = 'mongodb+srv://prajayfaldesai987_db_user:hGsIgjrHhhZV0A2X@cluster0.6agqfbt.mongodb.net/?appName=Cluster0'
+MONGODB_URI = os.getenv('MONGODB_URI', DEFAULT_MONGODB_URI)
+MONGODB_DB_NAME = os.getenv('MONGODB_DB', 'ai_plag_analyzer')
+mongo_client = None
+mongo_db = None
+
+try:
+    mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.server_info()
+    mongo_db = mongo_client[MONGODB_DB_NAME]
+    mongo_db['users'].create_index('username', unique=True)
+except PyMongoError:
+    mongo_client = None
+    mongo_db = None
+
+
+def get_user_collection():
+    return mongo_db['users'] if mongo_db is not None else None
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 
 def find_user(username: str) -> Optional[Dict[str, Any]]:
+    users = get_user_collection()
+    if users is not None:
+        return users.find_one({'username': username})
     return USERS.get(username)
 
 
 def find_user_by_token(token: str) -> Optional[Dict[str, Any]]:
+    users = get_user_collection()
+    if users is not None:
+        return users.find_one({'token': token})
     for user in USERS.values():
         if user.get('token') == token:
             return user
     return None
 
 
-def set_user_plan(token: str, plan: str, word_limit: int, size_limit_mb: Optional[float] = None) -> None:
-    """Persist the purchased plan + word/size allowance on the user's account."""
+def set_user_plan(token: str, plan: str, word_limit: int) -> None:
+    """Persist the purchased plan + word allowance on the user's account."""
     if not token:
         return
-    update = {'plan': plan, 'word_limit': word_limit, 'size_limit_mb': size_limit_mb}
+    users = get_user_collection()
+    if users is not None:
+        users.update_one({'token': token}, {'$set': {'plan': plan, 'word_limit': word_limit}})
+        return
     user = find_user_by_token(token)
     if user:
-        user.update(update)
+        user['plan'] = plan
+        user['word_limit'] = word_limit
 
 
 def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -107,7 +124,6 @@ def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         'created_at': user.get('created_at'),
         'plan': user.get('plan'),
         'word_limit': user.get('word_limit'),
-        'size_limit_mb': user.get('size_limit_mb'),
     }
 
 
@@ -171,7 +187,6 @@ def create_payment_event(
     phone_number: Optional[str] = None,
     token: Optional[str] = None,
     word_limit: Optional[int] = None,
-    size_limit_mb: Optional[float] = None,
 ) -> Dict[str, Any]:
     event = {
         "id": str(uuid.uuid4()),
@@ -185,7 +200,6 @@ def create_payment_event(
         "created_at": int(time.time()),
         "token": token,
         "word_limit": word_limit,
-        "size_limit_mb": size_limit_mb,
     }
     PAYMENT_EVENTS.append(event)
     return event
@@ -290,16 +304,29 @@ def signup(payload: SignupRequest):
     if not payload.username or not payload.password:
         raise HTTPException(status_code=400, detail="username and password are required")
 
-    if payload.username in USERS:
-        raise HTTPException(status_code=400, detail="User already exists")
-    token = str(uuid.uuid4())
-    USERS[payload.username] = {
-        'username': payload.username,
-        'email': payload.email,
-        'password_hash': hash_password(payload.password),
-        'token': token,
-        'created_at': int(time.time()),
-    }
+    users = get_user_collection()
+    if users is not None:
+        if users.find_one({'username': payload.username}):
+            raise HTTPException(status_code=400, detail="User already exists")
+        token = str(uuid.uuid4())
+        users.insert_one({
+            'username': payload.username,
+            'email': payload.email,
+            'password_hash': hash_password(payload.password),
+            'token': token,
+            'created_at': int(time.time()),
+        })
+    else:
+        if payload.username in USERS:
+            raise HTTPException(status_code=400, detail="User already exists")
+        token = str(uuid.uuid4())
+        USERS[payload.username] = {
+            'username': payload.username,
+            'email': payload.email,
+            'password': payload.password,
+            'token': token,
+            'created_at': int(time.time()),
+        }
 
     return {
         "status": "success",
@@ -333,6 +360,11 @@ def signin(payload: SigninRequest):
 
     token = str(uuid.uuid4())
     user['token'] = token
+    users = get_user_collection()
+    if users is not None:
+        users.update_one({'username': payload.username}, {'$set': {'token': token}})
+    else:
+        user['token'] = token
 
     return {
         "status": "success",
@@ -365,10 +397,8 @@ def admin_payments(authorization: Optional[str] = Header(None)):
 
 @app.post("/payment-confirm")
 def payment_confirm(payload: PaymentConfirmRequest):
-    print(f"[payment-confirm] looking for event id={payload.payment_event_id!r} among {len(PAYMENT_EVENTS)} known events: {[e['id'] for e in PAYMENT_EVENTS]}")
     target = next((item for item in PAYMENT_EVENTS if item["id"] == payload.payment_event_id), None)
     if not target:
-        print(f"[payment-confirm] NOT FOUND - event id={payload.payment_event_id!r}")
         raise HTTPException(status_code=404, detail="Payment event not found")
 
     target["status"] = payload.status
@@ -377,15 +407,7 @@ def payment_confirm(payload: PaymentConfirmRequest):
     target["confirmed_at"] = int(time.time())
 
     if payload.status == "completed" and target.get("token"):
-        set_user_plan(
-            target["token"],
-            target.get("plan"),
-            target.get("word_limit"),
-            target.get("size_limit_mb"),
-        )
-        print(f"[payment-confirm] set_user_plan called token={target['token']!r} plan={target.get('plan')} word_limit={target.get('word_limit')}")
-    else:
-        print(f"[payment-confirm] skipped set_user_plan - status={payload.status!r} token={target.get('token')!r}")
+        set_user_plan(target["token"], target.get("plan"), target.get("word_limit"))
 
     return {
         "status": "success",
@@ -469,43 +491,11 @@ async def analyze_document(
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
 
-    plan = user.get("plan")
-    # Word/size limits are looked up fresh from PLAN_WORD_LIMITS / PLAN_SIZE_LIMITS_MB
-    # by plan name every request - these are the source of truth. We do NOT trust
-    # user["word_limit"] / user["size_limit_mb"] here even though set_user_plan()
-    # caches them on the user at subscribe time; that cache is only kept for
-    # display/records and can drift (races between subscribe calls, retried
-    # payment-confirms, etc). Falling back to it only if the plan name itself is
-    # somehow missing from the current PLAN_WORD_LIMITS table (e.g. env var typo).
-    word_limit = PLAN_WORD_LIMITS.get(plan, user.get("word_limit"))
-    if not plan or not word_limit:
+    word_limit = user.get("word_limit")
+    if not user.get("plan") or not word_limit:
         raise HTTPException(status_code=402, detail="No active subscription found. Please subscribe to a plan first.")
 
-    print(f"[analyze] user={user.get('username')} plan={plan} word_limit={word_limit} mode={mode}")
-
     file_bytes = await file.read()
-
-    # Enforce the plan's file-size cap on the raw bytes, before we even parse
-    # the docx. This catches documents that are "big" due to images/embedded
-    # objects/formatting rather than raw word count, which the word-count
-    # check below can't see.
-    plan_size_limit_bytes = size_limit_bytes(plan)
-    if plan_size_limit_bytes is None:
-        user_size_limit_mb = user.get("size_limit_mb")
-        if user_size_limit_mb:
-            plan_size_limit_bytes = int(float(user_size_limit_mb) * 1024 * 1024)
-
-    if plan_size_limit_bytes and len(file_bytes) > plan_size_limit_bytes:
-        file_mb = len(file_bytes) / (1024 * 1024)
-        limit_mb = plan_size_limit_bytes / (1024 * 1024)
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Your '{user['plan']}' plan allows files up to {limit_mb:.1f} MB, "
-                f"but this file is {file_mb:.1f} MB. Upgrade your plan to analyze it."
-            ),
-        )
-
     temp_path = write_temp_docx(file_bytes)
 
     try:
@@ -605,7 +595,6 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
 
     amount = PLAN_PRICES[plan]
     word_limit = PLAN_WORD_LIMITS[plan]
-    plan_size_limit_mb = PLAN_SIZE_LIMITS_MB[plan]
     receipt = f"sub-{int(time.time())}"
     checkout = create_razorpay_order(amount=amount, receipt=receipt)
     token = authorization.replace("Bearer ", "", 1) if authorization else None
@@ -619,9 +608,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
             phone_number=payload.phone_number,
             token=token,
             word_limit=word_limit,
-            size_limit_mb=plan_size_limit_mb,
         )
-        print(f"[subscribe] created razorpay event id={event['id']} plan={payload.plan} token={token!r} total_events={len(PAYMENT_EVENTS)}")
         return {
             "status": "success",
             "provider": "razorpay",
@@ -647,9 +634,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
         phone_number=payload.phone_number,
         token=token,
         word_limit=word_limit,
-        size_limit_mb=plan_size_limit_mb,
     )
-    print(f"[subscribe] created demo event id={event['id']} plan={payload.plan} token={token!r} total_events={len(PAYMENT_EVENTS)}")
     return {
         "status": "success",
         "provider": "demo",
