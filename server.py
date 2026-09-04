@@ -52,6 +52,21 @@ PLAN_WORD_LIMITS: Dict[str, int] = {
     "premium_pro": int(os.getenv("PLAN_WORDS_PREMIUM_PRO", "10000")),
 }
 
+# Max uploaded file SIZE (in MB) per plan, checked on the raw bytes before the
+# document is even parsed. This exists separately from the word limit because
+# a file can be "big" (lots of MB) without having many extractable words -
+# e.g. a scanned document, embedded images, or heavy formatting/objects.
+PLAN_SIZE_LIMITS_MB: Dict[str, float] = {
+    "basic": float(os.getenv("PLAN_SIZE_MB_BASIC", "2")),
+    "premium": float(os.getenv("PLAN_SIZE_MB_PREMIUM", "5")),
+    "premium_pro": float(os.getenv("PLAN_SIZE_MB_PREMIUM_PRO", "8")),
+}
+
+
+def size_limit_bytes(plan: str) -> Optional[int]:
+    mb = PLAN_SIZE_LIMITS_MB.get(plan)
+    return int(mb * 1024 * 1024) if mb is not None else None
+
 
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'admin')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
@@ -100,18 +115,18 @@ def find_user_by_token(token: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def set_user_plan(token: str, plan: str, word_limit: int) -> None:
-    """Persist the purchased plan + word allowance on the user's account."""
+def set_user_plan(token: str, plan: str, word_limit: int, size_limit_mb: Optional[float] = None) -> None:
+    """Persist the purchased plan + word/size allowance on the user's account."""
     if not token:
         return
+    update = {'plan': plan, 'word_limit': word_limit, 'size_limit_mb': size_limit_mb}
     users = get_user_collection()
     if users is not None:
-        users.update_one({'token': token}, {'$set': {'plan': plan, 'word_limit': word_limit}})
+        users.update_one({'token': token}, {'$set': update})
         return
     user = find_user_by_token(token)
     if user:
-        user['plan'] = plan
-        user['word_limit'] = word_limit
+        user.update(update)
 
 
 def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -124,6 +139,7 @@ def serialize_user(user: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         'created_at': user.get('created_at'),
         'plan': user.get('plan'),
         'word_limit': user.get('word_limit'),
+        'size_limit_mb': user.get('size_limit_mb'),
     }
 
 
@@ -187,6 +203,7 @@ def create_payment_event(
     phone_number: Optional[str] = None,
     token: Optional[str] = None,
     word_limit: Optional[int] = None,
+    size_limit_mb: Optional[float] = None,
 ) -> Dict[str, Any]:
     event = {
         "id": str(uuid.uuid4()),
@@ -200,6 +217,7 @@ def create_payment_event(
         "created_at": int(time.time()),
         "token": token,
         "word_limit": word_limit,
+        "size_limit_mb": size_limit_mb,
     }
     PAYMENT_EVENTS.append(event)
     return event
@@ -407,7 +425,12 @@ def payment_confirm(payload: PaymentConfirmRequest):
     target["confirmed_at"] = int(time.time())
 
     if payload.status == "completed" and target.get("token"):
-        set_user_plan(target["token"], target.get("plan"), target.get("word_limit"))
+        set_user_plan(
+            target["token"],
+            target.get("plan"),
+            target.get("word_limit"),
+            target.get("size_limit_mb"),
+        )
 
     return {
         "status": "success",
@@ -496,6 +519,27 @@ async def analyze_document(
         raise HTTPException(status_code=402, detail="No active subscription found. Please subscribe to a plan first.")
 
     file_bytes = await file.read()
+
+    # Enforce the plan's file-size cap on the raw bytes, before we even parse
+    # the docx. This catches documents that are "big" due to images/embedded
+    # objects/formatting rather than raw word count, which the word-count
+    # check below can't see.
+    plan_size_limit_bytes = size_limit_bytes(user["plan"]) if user.get("plan") else None
+    user_size_limit_mb = user.get("size_limit_mb")
+    if user_size_limit_mb:
+        plan_size_limit_bytes = int(float(user_size_limit_mb) * 1024 * 1024)
+
+    if plan_size_limit_bytes and len(file_bytes) > plan_size_limit_bytes:
+        file_mb = len(file_bytes) / (1024 * 1024)
+        limit_mb = plan_size_limit_bytes / (1024 * 1024)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Your '{user['plan']}' plan allows files up to {limit_mb:.1f} MB, "
+                f"but this file is {file_mb:.1f} MB. Upgrade your plan to analyze it."
+            ),
+        )
+
     temp_path = write_temp_docx(file_bytes)
 
     try:
@@ -595,6 +639,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
 
     amount = PLAN_PRICES[plan]
     word_limit = PLAN_WORD_LIMITS[plan]
+    plan_size_limit_mb = PLAN_SIZE_LIMITS_MB[plan]
     receipt = f"sub-{int(time.time())}"
     checkout = create_razorpay_order(amount=amount, receipt=receipt)
     token = authorization.replace("Bearer ", "", 1) if authorization else None
@@ -608,6 +653,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
             phone_number=payload.phone_number,
             token=token,
             word_limit=word_limit,
+            size_limit_mb=plan_size_limit_mb,
         )
         return {
             "status": "success",
@@ -634,6 +680,7 @@ def subscribe(payload: SubscribeRequest, authorization: Optional[str] = Header(N
         phone_number=payload.phone_number,
         token=token,
         word_limit=word_limit,
+        size_limit_mb=plan_size_limit_mb,
     )
     return {
         "status": "success",
