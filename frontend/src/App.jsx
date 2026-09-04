@@ -189,7 +189,7 @@ export default function App() {
           handler: async function (response) {
             // Confirm the payment so the backend saves this plan + word limit on the user.
             try {
-              await fetch(buildApiUrl('/payment-confirm'), {
+              const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -198,10 +198,14 @@ export default function App() {
                   status: 'completed',
                 }),
               })
+              if (!confirmRes.ok) {
+                throw new Error(`Payment confirm returned ${confirmRes.status}`)
+              }
+              handlePaymentSuccess()
             } catch (confirmErr) {
               console.error('Payment confirm failed', confirmErr)
+              setError('Payment succeeded but we could not confirm your plan with the server. Please contact support before uploading a document.')
             }
-            handlePaymentSuccess()
           },
           prefill: {
             contact: data.phone_number || '',
@@ -215,7 +219,7 @@ export default function App() {
         razorpayInstance.open()
       } else if (data.provider === 'demo') {
         try {
-          await fetch(buildApiUrl('/payment-confirm'), {
+          const confirmRes = await fetch(buildApiUrl('/payment-confirm'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -224,10 +228,14 @@ export default function App() {
               status: 'completed',
             }),
           })
+          if (!confirmRes.ok) {
+            throw new Error(`Payment confirm returned ${confirmRes.status}`)
+          }
+          handlePaymentSuccess('Demo payment completed successfully. Your subscription is now active.')
         } catch (confirmErr) {
           console.error('Payment confirm failed', confirmErr)
+          setError('Payment succeeded but we could not confirm your plan with the server. Please try subscribing again.')
         }
-        handlePaymentSuccess('Demo payment completed successfully. Your subscription is now active.')
       }
     } catch (err) {
       setError(err.message)
