@@ -23,90 +23,18 @@ except Exception:
     openai = None
 
 
-def _iter_block_items(parent):
-    """Yield paragraphs and tables in the order they appear in the document body.
-
-    python-docx's `doc.paragraphs` and `doc.tables` are separate flat lists and
-    don't reflect document order, and neither one descends into the other
-    (table cells can contain their own paragraphs and even nested tables).
-    This walks the underlying XML so nothing gets skipped.
-    """
-    from docx.document import Document as _DocumentObj
-    from docx.table import Table, _Cell
-    from docx.text.paragraph import Paragraph
-    from docx.oxml.ns import qn
-
-    if isinstance(parent, _DocumentObj):
-        parent_elm = parent.element.body
-    elif isinstance(parent, _Cell):
-        parent_elm = parent._tc
-    else:
-        raise ValueError("unsupported parent type for block iteration")
-
-    for child in parent_elm.iterchildren():
-        if child.tag == qn('w:p'):
-            yield Paragraph(child, parent)
-        elif child.tag == qn('w:tbl'):
-            yield Table(child, parent)
-
-
-def _iter_table_paragraphs(table):
-    """Recursively yield every paragraph inside a table's cells (and nested tables)."""
-    for row in table.rows:
-        for cell in row.cells:
-            for block in _iter_block_items(cell):
-                if hasattr(block, "text"):  # Paragraph
-                    yield block
-                else:  # nested Table
-                    for p in _iter_table_paragraphs(block):
-                        yield p
-
-
-def _iter_header_footer_paragraphs(doc):
-    for section in doc.sections:
-        for part in (section.header, section.footer):
-            if part is None:
-                continue
-            for p in part.paragraphs:
-                yield p
-            for table in part.tables:
-                for p in _iter_table_paragraphs(table):
-                    yield p
-
-
 def load_paragraphs(path):
     doc = Document(path)
     paras = []
-    index = 0
-
-    # Body content (paragraphs + tables, including nested tables) in document order.
-    for block in _iter_block_items(doc):
-        if hasattr(block, "text"):  # Paragraph
-            candidates = [block]
-        else:  # Table
-            candidates = _iter_table_paragraphs(block)
-
-        for p in candidates:
-            text = p.text.strip()
-            if not text:
-                continue
-            paras.append({
-                "index": index,
-                "text": text,
-                "length": len(text),
-            })
-            index += 1
-
-    # Headers/footers are usually skipped for AI/plagiarism scoring (boilerplate),
-    # but they DO count toward document size, so the word limit can't be bypassed
-    # by stuffing content into them. Uncomment to include them in scoring too.
-    # for p in _iter_header_footer_paragraphs(doc):
-    #     text = p.text.strip()
-    #     if not text:
-    #         continue
-    #     paras.append({"index": index, "text": text, "length": len(text)})
-    #     index += 1
-
+    for i, p in enumerate(doc.paragraphs):
+        text = p.text.strip()
+        if not text:
+            continue
+        paras.append({
+            "index": i,
+            "text": text,
+            "length": len(text),
+        })
     return paras
 
 
