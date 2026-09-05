@@ -438,6 +438,7 @@ export default function App() {
           </div>
           <p className="brand-origin">An initiative of Saathaihum Foundation</p>
         </div>
+        
       </header>
 
       <div className="layout">
@@ -450,6 +451,7 @@ export default function App() {
                 <div className="panel-head">
                   <h2>Admin panel</h2>
                   <p className="panel-subtext">Review and confirm subscription payment activity.</p>
+                  
                 </div>
 
                 {!adminToken ? (
@@ -473,7 +475,10 @@ export default function App() {
                         className="input"
                         autoComplete="current-password"
                       />
+                      
+                      
                     </label>
+                    
                     <button className="btn btn-primary" type="submit" disabled={adminLoading}>
                       {adminLoading ? (
                         <>
@@ -486,8 +491,10 @@ export default function App() {
                     </button>
                     {adminError && <p className="form-error" role="alert">{adminError}</p>}
                   </form>
+                  
                 ) : (
                   <div>
+                  
                     <div className="panel-toolbar">
                       <div>
                         <p className="panel-toolbar-title">Logged in as admin</p>
@@ -500,8 +507,10 @@ export default function App() {
                         Log out
                       </button>
                     </div>
+                    
 
                     {adminError && <p className="form-error" role="alert">{adminError}</p>}
+                    
 
                     <div className="card">
                       <div className="card-head">
@@ -612,15 +621,105 @@ export default function App() {
                   </button>
                 </form>
 
-                <button
-                  className="btn-link"
-                  onClick={() => setAuthMode(authMode === 'signin' ? 'signup' : 'signin')}
-                >
-                  {authMode === 'signin' ? "Don't have an account? Create one" : 'Already have an account? Sign in'}
-                </button>
+               <button
+  className="btn-link"
+  style={{ padding: '12px 16px' }}
+  onClick={() => setAuthMode(authMode === 'signin' ? 'signup' : 'signin')}
+>
+  {authMode === 'signin'
+    ? "Don't have an account? Create one"
+    : 'Already have an account? Sign in'}
+</button>
 
                 {authError && <p className="form-error" role="alert">{authError}</p>}
                 {authMessage && <p className="form-success" role="status">{authMessage}</p>}
+
+                <div className="info-box">
+                  <h4>⚠️ * Terns and conditions </h4>
+
+                  <p>
+                    Please read the following notice carefully before proceeding with your
+                    payment and analysis.
+                  </p>
+
+                  <p>
+                    This is a <strong>one-time login and payment session</strong>. Your access
+                    is linked to your current analysis session. This system is designed this
+                    way to help protect the privacy and security of your uploaded documents
+                    and analysis data.
+                  </p>
+
+                  <p>
+                    <strong>⚠️ Do not reload, refresh, close, or navigate away from this page
+                    while your analysis is in progress.</strong>
+                  </p>
+
+                  <p>
+                    Reloading or leaving the page may permanently clear your current session,
+                    uploaded documents, analysis results, and other associated data. For
+                    privacy and security reasons, lost session data may not be recoverable.
+                  </p>
+
+                  <p>
+                    <strong>By proceeding, you acknowledge and agree to the following:</strong>
+                  </p>
+
+                  <ul>
+                    <li>
+                      Your payment provides access to the <strong>current analysis session only</strong>.
+                    </li>
+
+                    <li>
+                      If you <strong>reload or refresh the page</strong>, your current session,
+                      uploaded document, and analysis results may be lost.
+                    </li>
+
+                    <li>
+                      If your session is lost because you reload or leave the page, you may
+                      be required to <strong>make the payment again</strong> to start a new
+                      analysis session.
+                    </li>
+
+                    <li>
+                      Please download your analysis report and save any required results
+                      <strong> before refreshing, closing, or leaving the page</strong>.
+                    </li>
+
+                    <li>
+                      Do not use the browser's refresh button, close the tab, or navigate
+                      away from the analysis page until your analysis is complete and your
+                      results have been saved.
+                    </li>
+
+                    <li>
+                      This session-based approach is implemented as a
+                      <strong> data-privacy and security measure</strong> to minimize the
+                      retention and exposure of uploaded documents and analysis data.
+                    </li>
+                  </ul>
+
+                  <p>
+                    <strong>By continuing with the payment and analysis, you confirm that you
+                    have read, understood, and agreed to these terms.</strong>
+                  </p>
+
+                  <p className="info-box-note">
+                    <strong>Important:</strong> We strongly recommend downloading your
+                    analysis report immediately after your analysis is completed.
+                  </p>
+
+                  {externalError && (
+                    <p className="form-error">
+                      External API error: {externalError}
+                    </p>
+                  )}
+
+                  {!externalError && externalSource && (
+                    <p className="info-box-note">
+                      Plagiarism and AI detection data were returned from the external API.
+                    </p>
+                  )}
+                </div>
               </section>
             ) : activeNav === 'subscription' ? (
               <section className="panel">
@@ -707,9 +806,11 @@ export default function App() {
                   {subscriptionStatus && (
                     <p className="form-success" role="status">{subscriptionStatus.message}</p>
                   )}
+                  
                 </div>
 
                 {error && <p className="form-error" role="alert">{error}</p>}
+                
               </section>
             ) : (
               <>
